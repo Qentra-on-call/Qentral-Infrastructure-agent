@@ -1,0 +1,22 @@
+[Unit]
+Description=Qentra Infrastructure Agent
+Documentation=https://github.com/Qentra-on-call/Qentral-Infrastructure-agent
+After=network-online.target pveproxy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/qentra-infra-agent/env
+ExecStart=/usr/bin/node /opt/qentra-infra-agent/agent.js
+Restart=on-failure
+RestartSec=5
+# Needs root: pvesh talks to the local Proxmox API over a root-only unix
+# socket, and zpool status requires root on most distros. Deliberately NOT
+# sandboxed with ProtectSystem=strict — pvesh/pve-cluster's runtime sockets
+# live under /run in locations that vary by Proxmox version, and getting that
+# wrong would silently break collection with no clear error.
+User=root
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
