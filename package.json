@@ -1,6 +1,6 @@
 {
   "name": "qentra-infra-agent",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Qentra Infrastructure Agent — runs on Proxmox VE nodes, ships host/VM/storage state to Qentra.",
   "type": "module",
   "main": "agent.js",

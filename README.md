@@ -67,6 +67,12 @@ This installs the agent to `/opt/qentra-infra-agent`, its config to
   it reports CPU/NVMe temps fine on the same host. IPMI readings are
   labeled `ipmi/...` to distinguish them. Power draw via
   `ipmitool dcmi power reading` (read-only) if the host has BMC/IPMI access.
+  Fan entries report either an RPM tachometer reading (`{label, rpm}`) or,
+  on BMCs that only expose a commanded duty cycle instead of a tachometer
+  (observed on HPE iLO, ProLiant Gen10 — `sdr list` shows e.g. `Fan 1
+  DutyCycle | 28.22 percent | ok` with no RPM value anywhere), a percentage
+  (`{label, pct}`). Never reported as a fabricated RPM figure — the two
+  units are kept distinct end-to-end (agent, API, alerting, UI).
   Everything returns empty/null — silently, a normal state — when the
   underlying tool isn't installed or the hardware doesn't expose it.
   Nothing here is ever fabricated.
@@ -113,7 +119,9 @@ systemctl daemon-reload
 
 ## Status
 
-v0.1.0 — host/VM inventory + Ceph/ZFS storage health. See the
+v0.2.3 — host/VM inventory + Ceph/ZFS storage health + IO-wait + merged
+lm-sensors/IPMI hardware sensors (RPM or duty-cycle % fans) + network I/O.
+See the
 [Qentra Infrastructure Platform spec](https://qentra.it.com) for the
 longer-term roadmap (NUMA, SMART, live-migration tracking, predictive
 failure detection, correlation with the Kubernetes agent, and more).

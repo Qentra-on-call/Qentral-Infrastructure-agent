@@ -58,7 +58,7 @@ const NODE_NAME = process.env.NODE_NAME || os.hostname().split('.')[0];
 const CLUSTER_OVERRIDE = process.env.PROXMOX_CLUSTER || '';
 const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
-const VERSION = '0.2.2';
+const VERSION = '0.2.3';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -164,6 +164,14 @@ function collectIpmiSensors() {
       if (!name || !value) continue;
       const rpmMatch = value.match(/^([\d.]+)\s*RPM$/i);
       if (rpmMatch) { fans.push({ label: `ipmi/${name}`, rpm: Number(rpmMatch[1]) }); continue; }
+      // Some BMCs (observed: HPE iLO on ProLiant Gen10) don't expose a
+      // tachometer RPM reading via IPMI at all — only a commanded duty-cycle
+      // percentage (e.g. "Fan 1 DutyCycle | 28.22 percent | ok"). Report it
+      // honestly as a percentage rather than inventing an RPM figure. Scoped
+      // to sensor names containing "fan" so an unrelated percent-valued
+      // sensor (e.g. a PSU load reading) isn't misclassified as a fan.
+      const pctMatch = value.match(/^([\d.]+)\s*percent$/i);
+      if (pctMatch && /fan/i.test(name)) { fans.push({ label: `ipmi/${name}`, pct: Number(pctMatch[1]) }); continue; }
       const tempMatch = value.match(/^([\d.]+)\s*degrees C$/i);
       if (tempMatch) temps.push({ label: `ipmi/${name}`, tempC: Number(tempMatch[1]) });
     }
