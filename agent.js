@@ -6,7 +6,7 @@
 // Qentra every COLLECT_SECONDS. Pure Node stdlib, no npm deps — mirrors the
 // Kubernetes agent's philosophy (tiny, near-zero footprint).
 //
-// READ-ONLY BY DESIGN — audit this file for exactly four kinds of external
+// READ-ONLY BY DESIGN — audit this file for exactly five kinds of external
 // calls and nothing else (grep for "execFileSync" to verify every call site
 // if you're reviewing this before installing it on production hypervisors):
 //   1. `pvesh(path)` below, which ALWAYS runs `pvesh get ...` — never
@@ -14,8 +14,10 @@
 //      or reconfigure anything.
 //   2. `zpool status` (read-only diagnostic; not `zpool scrub`/`create`/etc).
 //   3. `sensors -j` (lm-sensors) — read-only hardware sensor query.
-//   4. `ipmitool dcmi power reading` — read-only BMC power query; no
-//      `ipmitool chassis`/`raw`/config subcommand is ever invoked.
+//   4. `ipmitool dcmi power reading` — read-only BMC power query.
+//   5. `ipmitool sdr list` — read-only BMC Sensor Data Record query (fan/temp
+//      readings from the BMC, e.g. HPE iLO). Neither ipmitool call ever
+//      invokes a `chassis`/`raw`/config subcommand that could change anything.
 // The agent never opens a network listener other than its own /healthz, and
 // never accepts inbound commands from Qentra — it only pushes snapshots out.
 //
@@ -56,7 +58,7 @@ const NODE_NAME = process.env.NODE_NAME || os.hostname().split('.')[0];
 const CLUSTER_OVERRIDE = process.env.PROXMOX_CLUSTER || '';
 const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
-const VERSION = '0.2.1';
+const VERSION = '0.2.2';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -143,6 +145,42 @@ function collectPowerWatts() {
   }
 }
 
+// Best-effort fan + temperature sensors via the BMC (`ipmitool sdr list` —
+// READ-ONLY Sensor Data Record query, same read-only guarantee as `dcmi power
+// reading`). Fills a real gap: many server vendors (HPE iLO, Dell iDRAC,
+// Supermicro) manage fan control entirely through the BMC rather than a
+// Super-I/O chip lm-sensors can probe on the local bus, so `sensors -j` can
+// report CPU/NVMe temps but ZERO fan data on that same hardware even though
+// the fans (and their RPM) are fully visible via IPMI. Labeled "ipmi/..." so
+// it's clearly distinguishable from lm-sensors readings when both exist.
+function collectIpmiSensors() {
+  const temps = [], fans = [];
+  try {
+    const out = execFileSync('ipmitool', ['sdr', 'list'], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] });
+    for (const line of out.split('\n')) {
+      const cols = line.split('|').map((c) => c.trim());
+      if (cols.length < 2) continue;
+      const [name, value] = cols;
+      if (!name || !value) continue;
+      const rpmMatch = value.match(/^([\d.]+)\s*RPM$/i);
+      if (rpmMatch) { fans.push({ label: `ipmi/${name}`, rpm: Number(rpmMatch[1]) }); continue; }
+      const tempMatch = value.match(/^([\d.]+)\s*degrees C$/i);
+      if (tempMatch) temps.push({ label: `ipmi/${name}`, tempC: Number(tempMatch[1]) });
+    }
+  } catch { /* ipmitool/BMC unavailable — normal, not an error */ }
+  return { temps: temps.slice(0, 32), fans: fans.slice(0, 32) };
+}
+
+// Combine lm-sensors + IPMI readings, capped so a chatty BMC can't bloat the
+// payload (the ingest schema itself also caps at 64 each — this just keeps
+// what's most likely to matter: local chip readings first, then BMC).
+function mergeSensors(local, ipmi) {
+  return {
+    temps: [...local.temps, ...ipmi.temps].slice(0, 48),
+    fans: [...local.fans, ...ipmi.fans].slice(0, 48),
+  };
+}
+
 function collectNode() {
   const status = pvesh(`/nodes/${NODE_NAME}/status`) || {};
   const cluster = pvesh('/cluster/status') || [];
@@ -183,7 +221,7 @@ function collectNode() {
     pveVersion: status.pveversion ?? undefined,
     loadAvg: Array.isArray(status.loadavg) ? status.loadavg.map(Number) : undefined,
     networkDown: collectNetworkDown(),
-    ...collectSensors(),
+    ...mergeSensors(collectSensors(), collectIpmiSensors()),
     powerWatts: collectPowerWatts() ?? undefined,
   };
 }

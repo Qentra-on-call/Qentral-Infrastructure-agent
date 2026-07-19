@@ -59,12 +59,17 @@ This installs the agent to `/opt/qentra-infra-agent`, its config to
   reports as inactive. This is read straight from `pvesh`'s own interface
   state, not a ping/throughput probe, so it reflects config-applied state
   rather than a live link test.
-- **Hardware sensors** *(best-effort)*: CPU/board temperatures and fan
-  speeds via `sensors -j` (lm-sensors) if installed; power draw via
+- **Hardware sensors** *(best-effort, two sources merged)*: CPU/board
+  temperatures and fan speeds via `sensors -j` (lm-sensors) if installed,
+  **plus** `ipmitool sdr list` (read-only BMC query) — needed because many
+  server vendors (HPE iLO, Dell iDRAC, Supermicro) manage fans entirely
+  through the BMC, invisible to lm-sensors' local chip probing even when
+  it reports CPU/NVMe temps fine on the same host. IPMI readings are
+  labeled `ipmi/...` to distinguish them. Power draw via
   `ipmitool dcmi power reading` (read-only) if the host has BMC/IPMI access.
-  Both return empty/null — silently, since this is a normal, common
-  state — when the underlying tool isn't installed or the hardware doesn't
-  expose it. Nothing here is ever fabricated.
+  Everything returns empty/null — silently, a normal state — when the
+  underlying tool isn't installed or the hardware doesn't expose it.
+  Nothing here is ever fabricated.
 
 This is a point-in-time snapshot on every collection cycle, not a full
 metrics time series — trend history is a possible future addition.
