@@ -55,10 +55,15 @@ chmod 600 "$CONF_DIR/env"
 curl -fsSL "$REPO_RAW/qentra-infra-agent.service" -o /etc/systemd/system/qentra-infra-agent.service
 
 systemctl daemon-reload
-systemctl enable --now qentra-infra-agent
+systemctl enable qentra-infra-agent
+# `enable --now` does NOT restart an already-running service — re-running this
+# script to pick up a fix would silently keep the OLD process alive forever,
+# with no error, indistinguishable from the fix not being applied at all.
+# Always force a fresh process.
+systemctl restart qentra-infra-agent
 
 echo
-echo "Qentra Infrastructure Agent installed and started."
+echo "Qentra Infrastructure Agent installed and started (fresh restart)."
 echo "Check status:  systemctl status qentra-infra-agent"
 echo "Check logs:    journalctl -u qentra-infra-agent -f"
 echo "Health check:  curl -s http://localhost:8081/healthz"
