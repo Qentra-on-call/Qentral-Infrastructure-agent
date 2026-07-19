@@ -56,7 +56,7 @@ const NODE_NAME = process.env.NODE_NAME || os.hostname().split('.')[0];
 const CLUSTER_OVERRIDE = process.env.PROXMOX_CLUSTER || '';
 const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -163,12 +163,18 @@ function collectNode() {
   // org can name/scope clusters however it authorized its token), falling back
   // to what Proxmox itself reports, then "default" for a standalone node.
   const clusterName = CLUSTER_OVERRIDE || clusterInfo?.name || 'default';
+  // IO wait — Proxmox reports it as a 0..1 fraction (`status.wait`), the same
+  // shape as `cpu`, in the SAME /nodes/<n>/status response already fetched
+  // above (no extra API call). High iowait with normal CPU means "storage is
+  // the bottleneck, not the CPU". Best-effort: undefined when absent.
+  const iowait = typeof status.wait === 'number' ? Math.max(0, Math.min(100, status.wait * 100)) : undefined;
   return {
     name: NODE_NAME,
     clusterName,
     quorate: clusterInfo ? !!clusterInfo.quorate : undefined,
     status: 'online',
     cpuUsedPct: cpu ?? undefined,
+    iowaitPct: iowait,
     cpuCores: status.cpuinfo?.cpus ?? undefined,
     memUsedBytes: mem.used ?? undefined,
     memTotalBytes: mem.total ?? undefined,

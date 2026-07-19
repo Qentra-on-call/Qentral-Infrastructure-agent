@@ -46,10 +46,10 @@ This installs the agent to `/opt/qentra-infra-agent`, its config to
 
 ## What it collects
 
-- **Host**: cluster name + quorum, CPU/memory usage, uptime, kernel/PVE
-  version, load average. CPU usage falls back to a load-average-based
-  estimate (`load1 / logical cores`) on Proxmox VE versions where the
-  direct API field reads as zero (observed on 9.2.4).
+- **Host**: cluster name + quorum, CPU/memory usage, IO wait, uptime,
+  kernel/PVE version, load average. CPU usage falls back to a
+  load-average-based estimate (`load1 / logical cores`) on Proxmox VE
+  versions where the direct API field reads as zero (observed on 9.2.4).
 - **VMs** (QEMU + LXC): status, CPU/memory/disk usage, uptime, cumulative
   network in/out bytes.
 - **Storage**: Ceph pools (health, OSD up/total) and ZFS pools (scrub
