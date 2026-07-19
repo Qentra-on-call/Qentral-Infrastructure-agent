@@ -58,7 +58,7 @@ const NODE_NAME = process.env.NODE_NAME || os.hostname().split('.')[0];
 const CLUSTER_OVERRIDE = process.env.PROXMOX_CLUSTER || '';
 const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
-const VERSION = '0.2.3';
+const VERSION = '0.2.4';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -156,7 +156,7 @@ function collectPowerWatts() {
 function collectIpmiSensors() {
   const temps = [], fans = [];
   try {
-    const out = execFileSync('ipmitool', ['sdr', 'list'], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] });
+    const out = execFileSync('ipmitool', ['sdr', 'list'], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] });
     for (const line of out.split('\n')) {
       const cols = line.split('|').map((c) => c.trim());
       if (cols.length < 2) continue;
@@ -175,7 +175,13 @@ function collectIpmiSensors() {
       const tempMatch = value.match(/^([\d.]+)\s*degrees C$/i);
       if (tempMatch) temps.push({ label: `ipmi/${name}`, tempC: Number(tempMatch[1]) });
     }
-  } catch { /* ipmitool/BMC unavailable — normal, not an error */ }
+    if (DEBUG) console.log(`[qentra-infra-agent] ipmitool sdr list -> ok (${temps.length} temp, ${fans.length} fan readings)`);
+  } catch (err) {
+    // Unlike a missing/absent BMC (the normal case on most hardware), a
+    // command that exists but fails is worth surfacing — this swallowed
+    // silently for a long time and made "why is fan data missing" undiagnosable.
+    console.error(`[qentra-infra-agent] ipmitool sdr list failed: ${err.code === 'ENOENT' ? 'ipmitool not installed' : (err.stderr?.toString().trim() || err.message)}`);
+  }
   return { temps: temps.slice(0, 32), fans: fans.slice(0, 32) };
 }
 
