@@ -31,10 +31,22 @@
 //   COLLECT_SECONDS  how often to collect + ship (default: 30)
 //   HEALTH_PORT      default 8081 (GET /healthz)
 import os from 'node:os';
+import dns from 'node:dns';
 import https from 'node:https';
 import http from 'node:http';
 import { URL } from 'node:url';
 import { execFileSync } from 'node:child_process';
+
+// Prefer IPv4 when a hostname resolves to both. Without this, Node can try an
+// IPv6 address first even on networks with no IPv6 route at all — the
+// connection attempt fails outright (not a timeout) but Node's fallback to
+// the working IPv4 address isn't always fast/clean for https.request, and it
+// can surface as "socket disconnected before secure TLS connection was
+// established" on EVERY attempt. Seen on a real customer's office network
+// with no IPv6 route; curl handled the fallback fine, Node's https module
+// didn't. This makes the agent work correctly on IPv6-less networks without
+// requiring any network reconfiguration.
+dns.setDefaultResultOrder('ipv4first');
 
 const URL_BASE = (process.env.QENTRA_URL || 'https://crm.qentra.it.com').replace(/\/$/, '');
 const TOKEN = process.env.QENTRA_TOKEN || '';
