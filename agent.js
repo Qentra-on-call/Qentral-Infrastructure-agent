@@ -58,7 +58,7 @@ const NODE_NAME = process.env.NODE_NAME || os.hostname().split('.')[0];
 const CLUSTER_OVERRIDE = process.env.PROXMOX_CLUSTER || '';
 const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
-const VERSION = '0.2.4';
+const VERSION = '0.2.5';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -156,7 +156,12 @@ function collectPowerWatts() {
 function collectIpmiSensors() {
   const temps = [], fans = [];
   try {
-    const out = execFileSync('ipmitool', ['sdr', 'list'], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] });
+    // `sdr list` enumerates every sensor over IPMI (often 40+ on dual-CPU
+    // servers) and was observed timing out at 10s specifically under the
+    // systemd service's CPUQuota=25% throttling (confirmed live: instant when
+    // run interactively as root, ETIMEDOUT every cycle under the service).
+    // 25s leaves headroom inside the 30s collection interval.
+    const out = execFileSync('ipmitool', ['sdr', 'list'], { encoding: 'utf8', timeout: 25_000, stdio: ['ignore', 'pipe', 'pipe'] });
     for (const line of out.split('\n')) {
       const cols = line.split('|').map((c) => c.trim());
       if (cols.length < 2) continue;
