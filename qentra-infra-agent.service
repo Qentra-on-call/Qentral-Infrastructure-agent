@@ -3,12 +3,18 @@ Description=Qentra Infrastructure Agent
 Documentation=https://github.com/Qentra-on-call/Qentral-Infrastructure-agent
 After=network-online.target pveproxy.service
 Wants=network-online.target
+# Never permanently give up retrying. An earlier version of this unit had a
+# MemoryMax tight enough to risk an OOM-kill loop; if that (or anything else)
+# ever crash-loops the agent, systemd's default restart-rate limit would stop
+# trying after 5 failures in 10s and the node would silently go dark. Disabling
+# the limit means it always keeps retrying instead of failing permanently.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 EnvironmentFile=/etc/qentra-infra-agent/env
 ExecStart=/usr/bin/node /opt/qentra-infra-agent/agent.js
-Restart=on-failure
+Restart=always
 RestartSec=5
 # Needs root: pvesh talks to the local Proxmox API over a root-only unix
 # socket, and zpool status requires root on most distros. Deliberately NOT
@@ -21,10 +27,12 @@ NoNewPrivileges=true
 # it must never be able to compete with VM workloads for CPU/RAM even if it
 # misbehaves (a runaway loop, a memory leak). The agent's actual footprint is a
 # few `pvesh get` calls every 30s; these ceilings are generous headroom, not a
-# tuned budget.
-CPUQuota=15%
-MemoryMax=128M
-TasksMax=64
+# tuned budget. MemoryMax was 128M — bumped to 256M after it looked like it may
+# have been OOM-killing the process (Node's baseline RSS + `pvesh` child-process
+# spawns can add up faster than expected under a tight cgroup cap).
+CPUQuota=25%
+MemoryMax=256M
+TasksMax=128
 # Below-normal scheduling priority so it never contends with VM/storage I/O.
 Nice=10
 IOSchedulingClass=best-effort
