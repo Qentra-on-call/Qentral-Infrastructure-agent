@@ -58,7 +58,7 @@ const NODE_NAME = process.env.NODE_NAME || os.hostname().split('.')[0];
 const CLUSTER_OVERRIDE = process.env.PROXMOX_CLUSTER || '';
 const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
-const VERSION = '0.2.5';
+const VERSION = '0.2.6';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -342,7 +342,7 @@ function collectStorage() {
   return pools;
 }
 
-function post(payload) {
+function postOnce(payload) {
   return new Promise((resolve) => {
     const url = new URL(`${URL_BASE}/api/ingest/proxmox`);
     const body = Buffer.from(JSON.stringify(payload));
@@ -354,16 +354,39 @@ function post(payload) {
         'Content-Length': body.length,
         Authorization: `Bearer ${TOKEN}`,
       },
+      // Force IPv4 at the SOCKET level. dns.setDefaultResultOrder('ipv4first')
+      // only reorders resolver results — Node can still open an IPv6 socket
+      // (e.g. a AAAA that resolves first for a later connection), and on a
+      // network with a broken/partial IPv6 route that surfaces as "Client
+      // network socket disconnected before secure TLS connection was
+      // established" every few cycles. family:4 guarantees IPv4 only, which is
+      // the reliable path on these Proxmox hosts.
+      family: 4,
       timeout: 15_000,
     }, (res) => {
       res.on('data', () => {});
       res.on('end', () => resolve(res.statusCode));
     });
-    req.on('error', (err) => { console.error('[qentra-infra-agent] ship failed:', err.message); resolve(0); });
+    req.on('error', (err) => { lastShipError = err.message; resolve(0); });
     req.on('timeout', () => req.destroy());
     req.write(body);
     req.end();
   });
+}
+let lastShipError = null;
+
+// Ship with a few quick in-cycle retries so a single dropped TLS handshake
+// (common on flaky office/uplink networks) doesn't cost the whole cycle. A 2xx
+// wins immediately; otherwise back off briefly and retry, up to 3 attempts.
+async function post(payload) {
+  const delays = [0, 1500, 4000];
+  let lastCode = 0;
+  for (let i = 0; i < delays.length; i += 1) {
+    if (delays[i]) await new Promise((r) => setTimeout(r, delays[i]));
+    lastCode = await postOnce(payload);
+    if (lastCode >= 200 && lastCode < 300) return lastCode;
+  }
+  return lastCode;
 }
 
 let lastOk = null;
@@ -374,7 +397,7 @@ async function collectAndShip() {
     const storagePools = collectStorage();
     const code = await post({ node, vms, storagePools });
     lastOk = code >= 200 && code < 300;
-    if (!lastOk) console.error(`[qentra-infra-agent] ingest returned HTTP ${code}`);
+    if (!lastOk) console.error(`[qentra-infra-agent] ingest failed after retries (HTTP ${code}${code === 0 && lastShipError ? `: ${lastShipError}` : ''})`);
   } catch (err) {
     lastOk = false;
     console.error('[qentra-infra-agent] collection failed:', err.message);
