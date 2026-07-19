@@ -73,6 +73,21 @@ qentra-infra-agent`:
 | `NODE_NAME` | this node's short hostname | Proxmox node name as seen in `pvesh` paths |
 | `COLLECT_SECONDS` | `30` | How often to collect + ship |
 | `HEALTH_PORT` | `8081` | Local `GET /healthz` port |
+| `DEBUG` | unset | Set to `1` to log every `pvesh` call's outcome (path, ok/fail, row count). Every `pvesh` *failure* is always logged regardless of this setting — check `journalctl -u qentra-infra-agent -f` if a node/VM/storage isn't showing up in Qentra. |
+
+## Troubleshooting "data isn't showing up"
+
+```bash
+systemctl status qentra-infra-agent   # is it even running?
+journalctl -u qentra-infra-agent -f   # tail logs; pvesh failures always print here
+curl -s http://localhost:8081/healthz # {"ok":true,...} if the last cycle shipped OK
+```
+
+If storage/Ceph isn't appearing specifically, the log will show
+`pvesh get /nodes/<node>/storage failed: ...` (or `/cluster/ceph/status
+failed: ...` for Ceph health) with the actual error — that's the fastest way
+to tell "pvesh itself is failing" apart from "there's genuinely nothing
+configured there."
 
 ## Uninstall
 

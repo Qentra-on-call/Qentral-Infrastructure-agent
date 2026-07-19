@@ -54,15 +54,26 @@ if (!TOKEN) {
 // so one missing/misconfigured subsystem (e.g. no Ceph) doesn't take down the
 // whole collection cycle. A short timeout + ignored stdin keeps this from ever
 // hanging or prompting — it cannot block pveproxy or wedge the node.
+// DEBUG=1 logs every pvesh call's outcome (path + ok/fail + row count) — turn
+// on when diagnosing "why isn't X showing up" via `journalctl -u qentra-infra-agent`.
+const DEBUG = process.env.DEBUG === '1';
+
 function pvesh(path) {
   try {
     const out = execFileSync('pvesh', ['get', path, '--output-format', 'json'], {
       encoding: 'utf8',
       timeout: 10_000,
-      stdio: ['ignore', 'pipe', 'ignore'],
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
-    return JSON.parse(out);
-  } catch {
+    const parsed = JSON.parse(out);
+    if (DEBUG) console.log(`[qentra-infra-agent] pvesh get ${path} -> ok (${Array.isArray(parsed) ? parsed.length + ' rows' : typeof parsed})`);
+    return parsed;
+  } catch (err) {
+    // Previously swallowed silently — the #1 reason "why isn't my data showing
+    // up" was unanswerable. Always log failures (not just under DEBUG) since
+    // they're rare enough not to be noisy and important enough to always see.
+    const detail = err.stderr ? String(err.stderr).trim().split('\n')[0] : err.message;
+    console.error(`[qentra-infra-agent] pvesh get ${path} failed: ${detail}`);
     return null;
   }
 }
@@ -151,8 +162,9 @@ function collectStorage() {
   const cephHealthy = cephStatus?.health?.status === 'HEALTH_OK';
   const cephWarn = cephStatus?.health?.status === 'HEALTH_WARN';
 
+  if (DEBUG) console.log(`[qentra-infra-agent] collectStorage: ${storages.length} storage def(s) from pvesh, cephStatus=${cephStatus ? 'present' : 'null'}`);
+
   for (const s of storages) {
-    if (s.active === 0) continue; // skip inactive/unreachable storage defs
     let type = 'other';
     if (s.type === 'rbd' || s.type === 'cephfs') type = 'ceph';
     else if (s.type === 'zfspool') type = 'zfs';
@@ -176,7 +188,12 @@ function collectStorage() {
       pool.zfsScrubState = scrub ?? undefined;
       pool.health = scrub && /errors: no known data errors/i.test(scrub) ? 'healthy' : scrub ? 'warning' : 'unknown';
     } else {
-      pool.health = 'healthy'; // active + reachable; no deeper health signal for lvm/dir/nfs yet
+      // Report even an inactive/unreachable storage def rather than hiding it —
+      // "this storage is broken" is more useful than silence. Previously this
+      // loop skipped anything with active !== 1, which could drop everything
+      // if a node's storage.cfg entries don't carry that field the way we
+      // assumed.
+      pool.health = s.active === 0 ? 'critical' : 'healthy';
     }
     pools.push(pool);
   }
