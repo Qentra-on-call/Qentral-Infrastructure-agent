@@ -6,14 +6,16 @@
 // Qentra every COLLECT_SECONDS. Pure Node stdlib, no npm deps — mirrors the
 // Kubernetes agent's philosophy (tiny, near-zero footprint).
 //
-// READ-ONLY BY DESIGN — audit this file for exactly two kinds of external
-// calls and nothing else:
+// READ-ONLY BY DESIGN — audit this file for exactly four kinds of external
+// calls and nothing else (grep for "execFileSync" to verify every call site
+// if you're reviewing this before installing it on production hypervisors):
 //   1. `pvesh(path)` below, which ALWAYS runs `pvesh get ...` — never
 //      `pvesh create/set/delete`. It cannot start, stop, migrate, snapshot,
-//      or reconfigure anything. Grep for "execFileSync" to verify every call
-//      site if you're reviewing this before installing it on production
-//      hypervisors.
+//      or reconfigure anything.
 //   2. `zpool status` (read-only diagnostic; not `zpool scrub`/`create`/etc).
+//   3. `sensors -j` (lm-sensors) — read-only hardware sensor query.
+//   4. `ipmitool dcmi power reading` — read-only BMC power query; no
+//      `ipmitool chassis`/`raw`/config subcommand is ever invoked.
 // The agent never opens a network listener other than its own /healthz, and
 // never accepts inbound commands from Qentra — it only pushes snapshots out.
 //
@@ -54,7 +56,7 @@ const NODE_NAME = process.env.NODE_NAME || os.hostname().split('.')[0];
 const CLUSTER_OVERRIDE = process.env.PROXMOX_CLUSTER || '';
 const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -101,12 +103,62 @@ function zfsScrubState(pool) {
   }
 }
 
+// Best-effort hardware temperature + fan sensors via lm-sensors (`sensors -j`
+// — read-only, ships on most Proxmox hosts or is a one-line `apt install
+// lm-sensors` away). Returns { temps: [{label, tempC}], fans: [{label, rpm}] }
+// or both empty arrays if lm-sensors isn't installed/configured — never
+// fabricated, and this failure mode is silent (unlike pvesh) because "no
+// lm-sensors installed" is a normal, common state, not an error to log.
+function collectSensors() {
+  const temps = [], fans = [];
+  try {
+    const out = execFileSync('sensors', ['-j'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+    const data = JSON.parse(out);
+    for (const [chip, features] of Object.entries(data)) {
+      if (!features || typeof features !== 'object') continue;
+      for (const [label, reading] of Object.entries(features)) {
+        if (!reading || typeof reading !== 'object') continue;
+        for (const [key, val] of Object.entries(reading)) {
+          if (typeof val !== 'number') continue;
+          if (key.endsWith('_input') && key.startsWith('temp')) temps.push({ label: `${chip}/${label}`, tempC: val });
+          else if (key.endsWith('_input') && key.startsWith('fan')) fans.push({ label: `${chip}/${label}`, rpm: val });
+        }
+      }
+    }
+  } catch { /* lm-sensors not installed/configured — normal, not an error */ }
+  return { temps: temps.slice(0, 32), fans: fans.slice(0, 32) };
+}
+
+// Best-effort power draw via ipmitool (requires BMC/IPMI access — common on
+// server-class hardware, absent on consumer boards/VMs). `dcmi power reading`
+// is a READ-ONLY query (no write/config subcommand is ever invoked). Returns
+// null if ipmitool isn't installed or the host has no accessible BMC.
+function collectPowerWatts() {
+  try {
+    const out = execFileSync('ipmitool', ['dcmi', 'power', 'reading'], { encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] });
+    const m = out.match(/Instantaneous power reading:\s*(\d+)\s*Watts/i);
+    return m ? Number(m[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
 function collectNode() {
   const status = pvesh(`/nodes/${NODE_NAME}/status`) || {};
   const cluster = pvesh('/cluster/status') || [];
   const clusterInfo = Array.isArray(cluster) ? cluster.find((c) => c.type === 'cluster') : null;
   const mem = status.memory || {};
-  const cpu = typeof status.cpu === 'number' ? status.cpu * 100 : null;
+  // Proxmox VE 9.2.4 has been observed always returning status.cpu = 0 (a real
+  // API behavior on that version, confirmed against a live host — not a bug in
+  // this agent). Fall back to a standard load-average-based estimate
+  // (load1 / logical cores) whenever the direct field reads as exactly zero,
+  // which a genuinely idle multi-core host essentially never does.
+  const cores = status.cpuinfo?.cpus;
+  let cpu = typeof status.cpu === 'number' && status.cpu > 0 ? status.cpu * 100 : null;
+  if (cpu == null && Array.isArray(status.loadavg) && cores) {
+    const load1 = Number(status.loadavg[0]);
+    if (Number.isFinite(load1)) cpu = Math.min(100, (load1 / cores) * 100);
+  }
   // The Qentra-facing cluster label: an explicit PROXMOX_CLUSTER wins (so an
   // org can name/scope clusters however it authorized its token), falling back
   // to what Proxmox itself reports, then "default" for a standalone node.
@@ -125,6 +177,8 @@ function collectNode() {
     pveVersion: status.pveversion ?? undefined,
     loadAvg: Array.isArray(status.loadavg) ? status.loadavg.map(Number) : undefined,
     networkDown: collectNetworkDown(),
+    ...collectSensors(),
+    powerWatts: collectPowerWatts() ?? undefined,
   };
 }
 
@@ -158,6 +212,10 @@ function collectVms() {
         diskUsedBytes: v.disk ?? undefined,
         diskMaxBytes: v.maxdisk ?? undefined,
         uptimeSeconds: v.uptime ?? undefined,
+        // Cumulative bytes since the VM started (Proxmox's own counters,
+        // already present in this list response — no extra API call).
+        netInBytes: v.netin ?? undefined,
+        netOutBytes: v.netout ?? undefined,
       });
     }
   }
