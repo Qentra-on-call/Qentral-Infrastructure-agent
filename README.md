@@ -51,6 +51,11 @@ This installs the agent to `/opt/qentra-infra-agent`, its config to
 - **VMs** (QEMU + LXC): status, CPU/memory/disk usage, uptime.
 - **Storage**: Ceph pools (health, OSD up/total) and ZFS pools (scrub
   state), plus capacity for other storage types (LVM/dir/NFS).
+- **Network** *(best-effort)*: physical uplinks (eth/bond only — not
+  bridges/VLANs, which are routinely inactive by design) that Proxmox itself
+  reports as inactive. This is read straight from `pvesh`'s own interface
+  state, not a ping/throughput probe, so it reflects config-applied state
+  rather than a live link test.
 
 This is a point-in-time snapshot on every collection cycle, not a full
 metrics time series — trend history is a possible future addition.

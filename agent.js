@@ -101,7 +101,21 @@ function collectNode() {
     kernelVersion: status.kversion ?? undefined,
     pveVersion: status.pveversion ?? undefined,
     loadAvg: Array.isArray(status.loadavg) ? status.loadavg.map(Number) : undefined,
+    networkDown: collectNetworkDown(),
   };
+}
+
+// Physical uplinks (eth/bond) Proxmox itself reports as inactive. Deliberately
+// narrow — NOT bridges/VLANs, which are routinely "down" by design (unused
+// trunk, a bridge with no member yet) and would just be alert noise. This is a
+// real signal from `pvesh get`, not a fabricated metric: Proxmox's own
+// /nodes/{node}/network already reports each interface's `active` state.
+function collectNetworkDown() {
+  const ifaces = pvesh(`/nodes/${NODE_NAME}/network`) || [];
+  return ifaces
+    .filter((i) => (i.type === 'eth' || i.type === 'bond') && i.active === 0)
+    .map((i) => i.iface)
+    .filter(Boolean);
 }
 
 function collectVms() {
