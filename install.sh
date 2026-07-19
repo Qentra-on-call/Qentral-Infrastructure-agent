@@ -7,6 +7,9 @@
 #
 # Optional env vars (same defaults as the agent):
 #   QENTRA_URL        default https://crm.qentra.it.com
+#   PROXMOX_CLUSTER   this cluster's Qentra label (e.g. "prod-1") — required if
+#                     your token is restricted to specific clusters; matches
+#                     what you named it when generating the token in Qentra
 #   NODE_NAME         default: this node's short hostname
 #   COLLECT_SECONDS   default 30
 set -euo pipefail
@@ -43,6 +46,7 @@ curl -fsSL "$REPO_RAW/package.json" -o "$INSTALL_DIR/package.json"
 cat > "$CONF_DIR/env" <<EOF
 QENTRA_URL=${QENTRA_URL:-https://crm.qentra.it.com}
 QENTRA_TOKEN=${QENTRA_TOKEN}
+PROXMOX_CLUSTER=${PROXMOX_CLUSTER:-}
 NODE_NAME=${NODE_NAME:-$(hostname -s)}
 COLLECT_SECONDS=${COLLECT_SECONDS:-30}
 EOF

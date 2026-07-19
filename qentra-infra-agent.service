@@ -17,6 +17,18 @@ RestartSec=5
 # wrong would silently break collection with no clear error.
 User=root
 NoNewPrivileges=true
+# Hard resource caps — this is a monitoring sidecar on a production hypervisor,
+# it must never be able to compete with VM workloads for CPU/RAM even if it
+# misbehaves (a runaway loop, a memory leak). The agent's actual footprint is a
+# few `pvesh get` calls every 30s; these ceilings are generous headroom, not a
+# tuned budget.
+CPUQuota=15%
+MemoryMax=128M
+TasksMax=64
+# Below-normal scheduling priority so it never contends with VM/storage I/O.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 
 [Install]
 WantedBy=multi-user.target

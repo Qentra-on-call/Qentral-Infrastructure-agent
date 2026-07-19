@@ -12,18 +12,37 @@ there's no separate Proxmox API token to create) and ships a snapshot every
 
 ## Install
 
-On each Proxmox node, as root:
+Get an install token from **Infrastructure → Manage clusters** in Qentra —
+same model as the Kubernetes agent: one token per Proxmox cluster, restricted
+to that cluster's name, so a leaked token for one cluster can't be used to
+impersonate another. If your org runs several Proxmox clusters (e.g. one per
+datacenter or rack), generate one token per cluster there.
+
+On each node **in that cluster**, as root:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Qentra-on-call/Qentral-Infrastructure-agent/main/install.sh \
-  | QENTRA_TOKEN=<your infra:write token> bash
+  | QENTRA_TOKEN=<token> PROXMOX_CLUSTER=<cluster name you gave it> bash
 ```
-
-Create the token in Qentra under **CLI → API tokens**, scope `infra:write`.
 
 This installs the agent to `/opt/qentra-infra-agent`, its config to
 `/etc/qentra-infra-agent/env`, and registers/starts the
 `qentra-infra-agent` systemd service.
+
+## Won't interfere with your nodes or the Proxmox API
+
+- **Strictly read-only.** Every Proxmox call is `pvesh get ...` — never
+  `create`/`set`/`delete`. The agent cannot start, stop, migrate, snapshot,
+  or reconfigure anything, and never accepts inbound commands from Qentra
+  (it only pushes snapshots out). See the audit note at the top of
+  `agent.js`.
+- **Resource-capped by systemd**, not just by convention:
+  `CPUQuota=15%`, `MemoryMax=128M`, `TasksMax=64`, and below-normal
+  scheduling/IO priority (`Nice=10`) — so it can never compete with VM
+  workloads even if something goes wrong.
+- **Light on the Proxmox API.** A handful of `pvesh get` calls (node status,
+  VM list, storage list, optionally Ceph/ZFS) every 30s per node — negligible
+  load, well below what the Proxmox web UI itself generates.
 
 ## What it collects
 
@@ -45,6 +64,7 @@ qentra-infra-agent`:
 |---|---|---|
 | `QENTRA_URL` | `https://crm.qentra.it.com` | Qentra API base (only override when self-hosting) |
 | `QENTRA_TOKEN` | *(required)* | ApiToken with scope `infra:write` |
+| `PROXMOX_CLUSTER` | Proxmox's own cluster name, or `default` | This cluster's Qentra label — required if your token is restricted to specific clusters |
 | `NODE_NAME` | this node's short hostname | Proxmox node name as seen in `pvesh` paths |
 | `COLLECT_SECONDS` | `30` | How often to collect + ship |
 | `HEALTH_PORT` | `8081` | Local `GET /healthz` port |

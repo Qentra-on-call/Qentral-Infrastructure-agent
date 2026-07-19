@@ -6,9 +6,28 @@
 // Qentra every COLLECT_SECONDS. Pure Node stdlib, no npm deps — mirrors the
 // Kubernetes agent's philosophy (tiny, near-zero footprint).
 //
+// READ-ONLY BY DESIGN — audit this file for exactly two kinds of external
+// calls and nothing else:
+//   1. `pvesh(path)` below, which ALWAYS runs `pvesh get ...` — never
+//      `pvesh create/set/delete`. It cannot start, stop, migrate, snapshot,
+//      or reconfigure anything. Grep for "execFileSync" to verify every call
+//      site if you're reviewing this before installing it on production
+//      hypervisors.
+//   2. `zpool status` (read-only diagnostic; not `zpool scrub`/`create`/etc).
+// The agent never opens a network listener other than its own /healthz, and
+// never accepts inbound commands from Qentra — it only pushes snapshots out.
+//
 //   QENTRA_URL       e.g. https://crm.qentra.it.com     (default: hosted Qentra)
 //   QENTRA_TOKEN     ApiToken with scope infra:write     (required)
 //   NODE_NAME        Proxmox node name (default: short hostname)
+//   PROXMOX_CLUSTER  label for this Proxmox cluster, e.g. "prod-1" — same idea
+//                    as the Kubernetes agent's CLUSTER_NAME. An org with
+//                    several Proxmox clusters (e.g. 4, one per DC/rack) gives
+//                    each its own name + its own cluster-scoped token, so one
+//                    compromised install token can't report as another
+//                    cluster. Defaults to the cluster name Proxmox itself
+//                    reports (pvesh /cluster/status), or "default" if
+//                    standalone.
 //   COLLECT_SECONDS  how often to collect + ship (default: 30)
 //   HEALTH_PORT      default 8081 (GET /healthz)
 import os from 'node:os';
@@ -20,6 +39,7 @@ import { execFileSync } from 'node:child_process';
 const URL_BASE = (process.env.QENTRA_URL || 'https://crm.qentra.it.com').replace(/\/$/, '');
 const TOKEN = process.env.QENTRA_TOKEN || '';
 const NODE_NAME = process.env.NODE_NAME || os.hostname().split('.')[0];
+const CLUSTER_OVERRIDE = process.env.PROXMOX_CLUSTER || '';
 const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
 const VERSION = '0.1.0';
@@ -29,9 +49,11 @@ if (!TOKEN) {
   process.exit(1);
 }
 
-// Run `pvesh get <path> --output-format json` and parse it. Returns null (never
-// throws) so one missing/misconfigured subsystem (e.g. no Ceph) doesn't take
-// down the whole collection cycle.
+// Run `pvesh get <path> --output-format json` and parse it — READ-ONLY, always
+// the `get` verb (see the file-header audit note). Returns null (never throws)
+// so one missing/misconfigured subsystem (e.g. no Ceph) doesn't take down the
+// whole collection cycle. A short timeout + ignored stdin keeps this from ever
+// hanging or prompting — it cannot block pveproxy or wedge the node.
 function pvesh(path) {
   try {
     const out = execFileSync('pvesh', ['get', path, '--output-format', 'json'], {
@@ -62,9 +84,13 @@ function collectNode() {
   const clusterInfo = Array.isArray(cluster) ? cluster.find((c) => c.type === 'cluster') : null;
   const mem = status.memory || {};
   const cpu = typeof status.cpu === 'number' ? status.cpu * 100 : null;
+  // The Qentra-facing cluster label: an explicit PROXMOX_CLUSTER wins (so an
+  // org can name/scope clusters however it authorized its token), falling back
+  // to what Proxmox itself reports, then "default" for a standalone node.
+  const clusterName = CLUSTER_OVERRIDE || clusterInfo?.name || 'default';
   return {
     name: NODE_NAME,
-    clusterName: clusterInfo?.name || undefined,
+    clusterName,
     quorate: clusterInfo ? !!clusterInfo.quorate : undefined,
     status: 'online',
     cpuUsedPct: cpu ?? undefined,
@@ -192,6 +218,6 @@ http.createServer((req, res) => {
   }
 }).listen(HEALTH_PORT);
 
-console.log(`[qentra-infra-agent] v${VERSION} starting — node=${NODE_NAME} target=${URL_BASE} every ${COLLECT_MS / 1000}s`);
+console.log(`[qentra-infra-agent] v${VERSION} starting — node=${NODE_NAME} cluster=${CLUSTER_OVERRIDE || '(auto)'} target=${URL_BASE} every ${COLLECT_MS / 1000}s`);
 collectAndShip();
 setInterval(collectAndShip, COLLECT_MS);
