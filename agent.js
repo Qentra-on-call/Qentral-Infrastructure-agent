@@ -173,6 +173,13 @@ function collectStorage() {
   const cephOsdTotal = cephStatus?.osdmap?.osdmap?.num_osds ?? cephStatus?.osdmap?.num_osds;
   const cephHealthy = cephStatus?.health?.status === 'HEALTH_OK';
   const cephWarn = cephStatus?.health?.status === 'HEALTH_WARN';
+  // The actual reason, not just OK/WARN/ERR — Ceph's health.checks is an object
+  // keyed by check name (e.g. "OSD_NEARFULL", "PG_DEGRADED"), each carrying a
+  // human summary message. Without this, "warning" on its own tells the
+  // operator nothing they can act on.
+  const cephDetail = cephStatus?.health?.checks
+    ? Object.values(cephStatus.health.checks).map((c) => c?.summary?.message).filter(Boolean).join('; ')
+    : undefined;
 
   if (DEBUG) console.log(`[qentra-infra-agent] collectStorage: ${storages.length} storage def(s) from pvesh, cephStatus=${cephStatus ? 'present' : 'null'}`);
 
@@ -195,10 +202,12 @@ function collectStorage() {
       pool.health = cephHealthy ? 'healthy' : cephWarn ? 'warning' : cephStatus ? 'critical' : 'unknown';
       pool.cephOsdUp = cephOsdUp ?? undefined;
       pool.cephOsdTotal = cephOsdTotal ?? undefined;
+      pool.healthDetail = cephDetail;
     } else if (type === 'zfs') {
       const scrub = zfsScrubState(s.storage);
       pool.zfsScrubState = scrub ?? undefined;
       pool.health = scrub && /errors: no known data errors/i.test(scrub) ? 'healthy' : scrub ? 'warning' : 'unknown';
+      pool.healthDetail = scrub ?? undefined;
     } else {
       // Report even an inactive/unreachable storage def rather than hiding it —
       // "this storage is broken" is more useful than silence. Previously this
