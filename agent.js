@@ -34,6 +34,16 @@
 //                    standalone.
 //   COLLECT_SECONDS  how often to collect + ship (default: 30)
 //   HEALTH_PORT      default 8081 (GET /healthz)
+//   REFRESH_HOURS    self-restart interval in hours (default: 3, 0 disables).
+//                     Belt-and-suspenders: `Restart=always` in the systemd
+//                     unit only fires when the process actually exits/crashes,
+//                     but a long-lived Node process can go quietly stale (a
+//                     wedged connection, an accumulated leak) without ever
+//                     crashing — the historical fix for that has been "SSH in
+//                     and reinstall", which just restarts the same binary.
+//                     This does the same restart automatically on a timer, no
+//                     reinstall needed. Exits cleanly (not a crash) so systemd
+//                     brings up a fresh process after RestartSec.
 import os from 'node:os';
 import dns from 'node:dns';
 import https from 'node:https';
@@ -58,7 +68,8 @@ const NODE_NAME = process.env.NODE_NAME || os.hostname().split('.')[0];
 const CLUSTER_OVERRIDE = process.env.PROXMOX_CLUSTER || '';
 const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
-const VERSION = '0.2.6';
+const REFRESH_HOURS = process.env.REFRESH_HOURS != null ? Number(process.env.REFRESH_HOURS) : 3;
+const VERSION = '0.2.7';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -414,6 +425,17 @@ http.createServer((req, res) => {
   }
 }).listen(HEALTH_PORT);
 
-console.log(`[qentra-infra-agent] v${VERSION} starting — node=${NODE_NAME} cluster=${CLUSTER_OVERRIDE || '(auto)'} target=${URL_BASE} every ${COLLECT_MS / 1000}s`);
+// Periodic self-restart — see REFRESH_HOURS above. Jittered up to 10% so a
+// whole fleet installed at the same time doesn't cycle in lockstep later.
+if (REFRESH_HOURS > 0) {
+  const refreshMs = REFRESH_HOURS * 3600_000;
+  const jitterMs = Math.random() * refreshMs * 0.1;
+  setTimeout(() => {
+    console.log(`[qentra-infra-agent] periodic refresh after ~${REFRESH_HOURS}h uptime — exiting cleanly for systemd to restart`);
+    process.exit(0);
+  }, refreshMs + jitterMs);
+}
+
+console.log(`[qentra-infra-agent] v${VERSION} starting — node=${NODE_NAME} cluster=${CLUSTER_OVERRIDE || '(auto)'} target=${URL_BASE} every ${COLLECT_MS / 1000}s${REFRESH_HOURS > 0 ? `, self-refresh every ~${REFRESH_HOURS}h` : ''}`);
 collectAndShip();
 setInterval(collectAndShip, COLLECT_MS);
