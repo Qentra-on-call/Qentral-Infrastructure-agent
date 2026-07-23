@@ -34,16 +34,23 @@
 //                    standalone.
 //   COLLECT_SECONDS  how often to collect + ship (default: 30)
 //   HEALTH_PORT      default 8081 (GET /healthz)
-//   REFRESH_HOURS    self-restart interval in hours (default: 3, 0 disables).
-//                     Belt-and-suspenders: `Restart=always` in the systemd
-//                     unit only fires when the process actually exits/crashes,
-//                     but a long-lived Node process can go quietly stale (a
-//                     wedged connection, an accumulated leak) without ever
-//                     crashing — the historical fix for that has been "SSH in
-//                     and reinstall", which just restarts the same binary.
-//                     This does the same restart automatically on a timer, no
-//                     reinstall needed. Exits cleanly (not a crash) so systemd
-//                     brings up a fresh process after RestartSec.
+//   REFRESH_HOURS    long-period hygiene self-restart, in hours (default: 3,
+//                     0 disables). Belt-and-suspenders general refresh — see
+//                     STALE_MIN below for the fast-recovery watchdog, which is
+//                     the one that actually catches a wedged agent quickly.
+//   STALE_MIN        watchdog: if no successful ingest in this many minutes,
+//                     self-restart (default: 8, 0 disables). THIS is the fix
+//                     for the historical failure mode — the agent process
+//                     stays alive and even keeps its /healthz port open, but
+//                     silently stops shipping data (a wedged connection, a
+//                     hung child process) without ever crashing, so
+//                     `Restart=always` never triggers because there's nothing
+//                     to restart from systemd's point of view. The old fix was
+//                     "SSH in and reinstall", which just restarts the same
+//                     binary — this does that automatically, within minutes,
+//                     with no reinstall and no human needed. Runs on its own
+//                     interval independent of collectAndShip, so it still
+//                     fires even if a collection cycle is hung.
 import os from 'node:os';
 import dns from 'node:dns';
 import https from 'node:https';
@@ -69,7 +76,8 @@ const CLUSTER_OVERRIDE = process.env.PROXMOX_CLUSTER || '';
 const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
 const REFRESH_HOURS = process.env.REFRESH_HOURS != null ? Number(process.env.REFRESH_HOURS) : 3;
-const VERSION = '0.2.7';
+const STALE_MIN = process.env.STALE_MIN != null ? Number(process.env.STALE_MIN) : 8;
+const VERSION = '0.2.8';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -401,6 +409,9 @@ async function post(payload) {
 }
 
 let lastOk = null;
+// Start optimistic (now, not 0) so a slow-but-healthy first boot isn't flagged
+// stale before it's even had a chance to ship once.
+let lastSuccessAt = Date.now();
 async function collectAndShip() {
   try {
     const node = collectNode();
@@ -408,7 +419,8 @@ async function collectAndShip() {
     const storagePools = collectStorage();
     const code = await post({ node, vms, storagePools });
     lastOk = code >= 200 && code < 300;
-    if (!lastOk) console.error(`[qentra-infra-agent] ingest failed after retries (HTTP ${code}${code === 0 && lastShipError ? `: ${lastShipError}` : ''})`);
+    if (lastOk) lastSuccessAt = Date.now();
+    else console.error(`[qentra-infra-agent] ingest failed after retries (HTTP ${code}${code === 0 && lastShipError ? `: ${lastShipError}` : ''})`);
   } catch (err) {
     lastOk = false;
     console.error('[qentra-infra-agent] collection failed:', err.message);
@@ -425,6 +437,20 @@ http.createServer((req, res) => {
   }
 }).listen(HEALTH_PORT);
 
+// Stuck-agent watchdog — see STALE_MIN above. Checked every 60s on its own
+// timer (independent of collectAndShip) so it still fires even if a cycle is
+// hung. Exits non-zero (a real failure, unlike the clean REFRESH_HOURS exit)
+// so it's visible in `systemctl status` / journalctl as a genuine recovery.
+if (STALE_MIN > 0) {
+  setInterval(() => {
+    const staleMs = Date.now() - lastSuccessAt;
+    if (staleMs > STALE_MIN * 60_000) {
+      console.error(`[qentra-infra-agent] no successful ingest in ${Math.round(staleMs / 60_000)}m (limit ${STALE_MIN}m) — self-restarting`);
+      process.exit(1);
+    }
+  }, 60_000);
+}
+
 // Periodic self-restart — see REFRESH_HOURS above. Jittered up to 10% so a
 // whole fleet installed at the same time doesn't cycle in lockstep later.
 if (REFRESH_HOURS > 0) {
@@ -436,6 +462,6 @@ if (REFRESH_HOURS > 0) {
   }, refreshMs + jitterMs);
 }
 
-console.log(`[qentra-infra-agent] v${VERSION} starting — node=${NODE_NAME} cluster=${CLUSTER_OVERRIDE || '(auto)'} target=${URL_BASE} every ${COLLECT_MS / 1000}s${REFRESH_HOURS > 0 ? `, self-refresh every ~${REFRESH_HOURS}h` : ''}`);
+console.log(`[qentra-infra-agent] v${VERSION} starting — node=${NODE_NAME} cluster=${CLUSTER_OVERRIDE || '(auto)'} target=${URL_BASE} every ${COLLECT_MS / 1000}s${STALE_MIN > 0 ? `, watchdog restarts after ${STALE_MIN}m stuck` : ''}${REFRESH_HOURS > 0 ? `, self-refresh every ~${REFRESH_HOURS}h` : ''}`);
 collectAndShip();
 setInterval(collectAndShip, COLLECT_MS);
