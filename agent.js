@@ -77,7 +77,7 @@ const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
 const REFRESH_HOURS = process.env.REFRESH_HOURS != null ? Number(process.env.REFRESH_HOURS) : 3;
 const STALE_MIN = process.env.STALE_MIN != null ? Number(process.env.STALE_MIN) : 8;
-const VERSION = '0.2.8';
+const VERSION = '0.2.9';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -261,6 +261,12 @@ function collectNode() {
     networkDown: collectNetworkDown(),
     ...mergeSensors(collectSensors(), collectIpmiSensors()),
     powerWatts: collectPowerWatts() ?? undefined,
+    // Fleet-management contract (see docs/infra-agent-self-update.md): an
+    // agent that omits this is treated as OUTDATED, not current — so this
+    // must actually be sent, not just defined. Was missing entirely before
+    // v0.2.8, so every node showed agentVersion=null regardless of what was
+    // really running, and the update banner could never tell who to upgrade.
+    agentVersion: VERSION,
   };
 }
 
