@@ -30,7 +30,19 @@ NoNewPrivileges=true
 # tuned budget. MemoryMax was 128M — bumped to 256M after it looked like it may
 # have been OOM-killing the process (Node's baseline RSS + `pvesh` child-process
 # spawns can add up faster than expected under a tight cgroup cap).
-CPUQuota=25%
+# CPUQuota was 25% — confirmed live (a busy office-on-prem host with many
+# VMs/pools) that a real collection cycle needs ~2-2.5min of actual CPU time
+# to parse/process everything; at a 25% cap that FORCES ~8-10min of wall-clock
+# per cycle, which collides almost exactly with the agent's own STALE_MIN
+# (8min) stuck-ingest watchdog — the cap and the watchdog fight each other,
+# guaranteeing a permanent restart loop that never ships data on any host
+# whose real per-cycle CPU need exceeds roughly STALE_MIN x CPUQuota. Raised
+# to 100%: the agent is still single-threaded (one JS thread + short-lived
+# `pvesh`/`ipmitool` children), so this caps it at roughly ONE core's worth of
+# usage regardless — negligible on any real multi-core hypervisor, and Nice=10
+# + IOSchedulingClass=best-effort below are what actually protect VM workloads
+# under contention, not this percentage.
+CPUQuota=100%
 MemoryMax=256M
 TasksMax=128
 # Below-normal scheduling priority so it never contends with VM/storage I/O.
