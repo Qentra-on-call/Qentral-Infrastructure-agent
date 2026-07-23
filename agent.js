@@ -80,7 +80,7 @@ const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
 const REFRESH_HOURS = process.env.REFRESH_HOURS != null ? Number(process.env.REFRESH_HOURS) : 3;
 const STALE_MIN = process.env.STALE_MIN != null ? Number(process.env.STALE_MIN) : 8;
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -509,7 +509,16 @@ async function applyUpdate(update) {
     // Syntax-validate before the running binary is ever touched — a build
     // that's a valid hash but somehow not valid JS (a bad publish, a
     // half-uploaded artifact) fails here, not after it's already live.
-    const tmpPath = path.join(AGENT_DIR, `.agent.js.download-${Date.now()}`);
+    // MUST end in .js (not just contain it) — Node's ESM loader picks the
+    // module format from the file extension, and package.json's "type":
+    // "module" only resolves for recognized JS extensions. A `.download-*`
+    // suffix with no real extension throws ERR_UNKNOWN_FILE_EXTENSION before
+    // `--check` ever looks at the actual syntax (confirmed live: this exact
+    // mistake made a real v0.3.0 rollout fail-safe on 4 hosts — the checksum
+    // had already verified fine, only this naming bug was wrong. Harmless by
+    // design: it aborted before touching the running binary — but fix it so
+    // rollouts actually succeed).
+    const tmpPath = path.join(AGENT_DIR, `.agent-download-${Date.now()}.js`);
     fs.writeFileSync(tmpPath, bytes, { mode: 0o755 });
     try {
       execFileSync(process.execPath, ['--check', tmpPath], { timeout: 10_000, stdio: ['ignore', 'ignore', 'pipe'] });
