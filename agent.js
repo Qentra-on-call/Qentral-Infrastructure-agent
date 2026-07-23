@@ -77,7 +77,7 @@ const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
 const REFRESH_HOURS = process.env.REFRESH_HOURS != null ? Number(process.env.REFRESH_HOURS) : 3;
 const STALE_MIN = process.env.STALE_MIN != null ? Number(process.env.STALE_MIN) : 8;
-const VERSION = '0.2.9';
+const VERSION = '0.2.10';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -93,9 +93,9 @@ if (!TOKEN) {
 // on when diagnosing "why isn't X showing up" via `journalctl -u qentra-infra-agent`.
 const DEBUG = process.env.DEBUG === '1';
 
-function pvesh(path) {
+function pvesh(path, extraArgs = []) {
   try {
-    const out = execFileSync('pvesh', ['get', path, '--output-format', 'json'], {
+    const out = execFileSync('pvesh', ['get', path, ...extraArgs, '--output-format', 'json'], {
       encoding: 'utf8',
       timeout: 10_000,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -111,6 +111,18 @@ function pvesh(path) {
     console.error(`[qentra-infra-agent] pvesh get ${path} failed: ${detail}`);
     return null;
   }
+}
+
+// Real sampled CPU usage from Proxmox's own RRD data — the same source its
+// summary page reads, and unaffected by the direct-status-field bug below.
+// Returns the most recent bucket that actually has a cpu sample (the newest
+// bucket is sometimes still null/pending), as a 0..100 percentage, or null.
+function cpuFromRrd() {
+  const rows = pvesh(`/nodes/${NODE_NAME}/rrddata`, ['--timeframe', 'hour', '--cf', 'AVERAGE']) || [];
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (typeof rows[i]?.cpu === 'number') return Math.max(0, Math.min(100, rows[i].cpu * 100));
+  }
+  return null;
 }
 
 // Best-effort local ZFS scrub state — `zpool status` isn't a pvesh endpoint.
@@ -226,11 +238,17 @@ function collectNode() {
   const mem = status.memory || {};
   // Proxmox VE 9.2.4 has been observed always returning status.cpu = 0 (a real
   // API behavior on that version, confirmed against a live host — not a bug in
-  // this agent). Fall back to a standard load-average-based estimate
-  // (load1 / logical cores) whenever the direct field reads as exactly zero,
-  // which a genuinely idle multi-core host essentially never does.
+  // this agent). When that happens, prefer the RRD-sampled value (the same
+  // source Proxmox's own summary page reads) over a load-average estimate.
+  // load1/cores was tried first and produced a real false alarm: on a busy
+  // multi-VM hypervisor, load average routinely exceeds the physical core
+  // count (each VM's vCPU threads count toward load without the host actually
+  // being CPU-saturated), clamping straight to a false 100% — a host reading
+  // Proxmox's own summary as 83% got reported to Qentra as 100% and paged.
+  // load1/cores is now the LAST resort, only when RRD has no sample either.
   const cores = status.cpuinfo?.cpus;
   let cpu = typeof status.cpu === 'number' && status.cpu > 0 ? status.cpu * 100 : null;
+  if (cpu == null) cpu = cpuFromRrd();
   if (cpu == null && Array.isArray(status.loadavg) && cores) {
     const load1 = Number(status.loadavg[0]);
     if (Number.isFinite(load1)) cpu = Math.min(100, (load1 / cores) * 100);
