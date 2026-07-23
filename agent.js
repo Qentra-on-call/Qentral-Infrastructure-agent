@@ -80,7 +80,7 @@ const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
 const REFRESH_HOURS = process.env.REFRESH_HOURS != null ? Number(process.env.REFRESH_HOURS) : 3;
 const STALE_MIN = process.env.STALE_MIN != null ? Number(process.env.STALE_MIN) : 8;
-const VERSION = '0.3.1';
+const VERSION = '0.3.2';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -165,15 +165,44 @@ function collectSensors() {
   return { temps: temps.slice(0, 32), fans: fans.slice(0, 32) };
 }
 
+// Circuit breaker for ipmitool — on a host whose BMC is genuinely slow or
+// unreachable, EVERY call costs its full timeout (up to 25s for `sdr list`).
+// Confirmed live: one such host never completed a single collection cycle
+// (30s budget) and restart-looped every ~8min forever without ever shipping
+// data — the STALE_MIN watchdog just kept curing the symptom, not the cause.
+// After a run of consecutive failures, skip the call entirely for a cooldown
+// window instead of paying the full timeout every single cycle; still
+// retries periodically so a BMC that recovers gets picked back up.
+const IPMI_TRIP_AFTER = 3;
+const IPMI_COOLDOWN_MS = 10 * 60_000;
+const ipmiBreaker = { sdr: { fails: 0, until: 0 }, power: { fails: 0, until: 0 } };
+function ipmiGuard(state, label, run, empty) {
+  if (Date.now() < state.until) return empty;
+  try {
+    const result = run();
+    state.fails = 0;
+    return result;
+  } catch (err) {
+    state.fails += 1;
+    if (state.fails >= IPMI_TRIP_AFTER && Date.now() >= state.until) {
+      state.until = Date.now() + IPMI_COOLDOWN_MS;
+      console.error(`[qentra-infra-agent] ${label}: ${IPMI_TRIP_AFTER} consecutive failures — backing off for ${IPMI_COOLDOWN_MS / 60_000}min instead of retrying every cycle`);
+    }
+    throw err;
+  }
+}
+
 // Best-effort power draw via ipmitool (requires BMC/IPMI access — common on
 // server-class hardware, absent on consumer boards/VMs). `dcmi power reading`
 // is a READ-ONLY query (no write/config subcommand is ever invoked). Returns
 // null if ipmitool isn't installed or the host has no accessible BMC.
 function collectPowerWatts() {
   try {
-    const out = execFileSync('ipmitool', ['dcmi', 'power', 'reading'], { encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] });
-    const m = out.match(/Instantaneous power reading:\s*(\d+)\s*Watts/i);
-    return m ? Number(m[1]) : null;
+    return ipmiGuard(ipmiBreaker.power, 'ipmitool dcmi power reading', () => {
+      const out = execFileSync('ipmitool', ['dcmi', 'power', 'reading'], { encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] });
+      const m = out.match(/Instantaneous power reading:\s*(\d+)\s*Watts/i);
+      return m ? Number(m[1]) : null;
+    }, null);
   } catch {
     return null;
   }
@@ -194,8 +223,12 @@ function collectIpmiSensors() {
     // servers) and was observed timing out at 10s specifically under the
     // systemd service's CPUQuota=25% throttling (confirmed live: instant when
     // run interactively as root, ETIMEDOUT every cycle under the service).
-    // 25s leaves headroom inside the 30s collection interval.
-    const out = execFileSync('ipmitool', ['sdr', 'list'], { encoding: 'utf8', timeout: 25_000, stdio: ['ignore', 'pipe', 'pipe'] });
+    // 25s leaves headroom inside the 30s collection interval — but on a host
+    // whose BMC is genuinely unreachable rather than just slow, even 25s
+    // isn't enough, and that cost was being paid on EVERY cycle forever (see
+    // ipmiGuard above). Guarded so a consistently-broken BMC backs off.
+    const out = ipmiGuard(ipmiBreaker.sdr, 'ipmitool sdr list', () => execFileSync('ipmitool', ['sdr', 'list'], { encoding: 'utf8', timeout: 25_000, stdio: ['ignore', 'pipe', 'pipe'] }), '');
+    if (out === '' && Date.now() < ipmiBreaker.sdr.until) return { temps: [], fans: [] }; // in cooldown, skipped entirely
     for (const line of out.split('\n')) {
       const cols = line.split('|').map((c) => c.trim());
       if (cols.length < 2) continue;
