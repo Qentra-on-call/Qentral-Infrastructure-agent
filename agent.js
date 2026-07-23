@@ -55,8 +55,11 @@ import os from 'node:os';
 import dns from 'node:dns';
 import https from 'node:https';
 import http from 'node:http';
-import { URL } from 'node:url';
+import { URL, fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 
 // Prefer IPv4 when a hostname resolves to both. Without this, Node can try an
 // IPv6 address first even on networks with no IPv6 route at all — the
@@ -77,7 +80,7 @@ const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
 const REFRESH_HOURS = process.env.REFRESH_HOURS != null ? Number(process.env.REFRESH_HOURS) : 3;
 const STALE_MIN = process.env.STALE_MIN != null ? Number(process.env.STALE_MIN) : 8;
-const VERSION = '0.2.10';
+const VERSION = '0.3.0';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -385,6 +388,11 @@ function collectStorage() {
   return pools;
 }
 
+// Returns { code, body } — body is the parsed JSON response (or null), needed
+// so the caller can read back `update` (a pending self-update job, if any)
+// without a second request. Every ordinary ingest carries this possibility on
+// its response, per the fleet-management contract in
+// docs/infra-agent-self-update.md.
 function postOnce(payload) {
   return new Promise((resolve) => {
     const url = new URL(`${URL_BASE}/api/ingest/proxmox`);
@@ -407,10 +415,15 @@ function postOnce(payload) {
       family: 4,
       timeout: 15_000,
     }, (res) => {
-      res.on('data', () => {});
-      res.on('end', () => resolve(res.statusCode));
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        let parsed = null;
+        try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { /* non-JSON or empty — leave null */ }
+        resolve({ code: res.statusCode, body: parsed });
+      });
     });
-    req.on('error', (err) => { lastShipError = err.message; resolve(0); });
+    req.on('error', (err) => { lastShipError = err.message; resolve({ code: 0, body: null }); });
     req.on('timeout', () => req.destroy());
     req.write(body);
     req.end();
@@ -423,13 +436,133 @@ let lastShipError = null;
 // wins immediately; otherwise back off briefly and retry, up to 3 attempts.
 async function post(payload) {
   const delays = [0, 1500, 4000];
-  let lastCode = 0;
+  let last = { code: 0, body: null };
   for (let i = 0; i < delays.length; i += 1) {
     if (delays[i]) await new Promise((r) => setTimeout(r, delays[i]));
-    lastCode = await postOnce(payload);
-    if (lastCode >= 200 && lastCode < 300) return lastCode;
+    last = await postOnce(payload);
+    if (last.code >= 200 && last.code < 300) return last;
   }
-  return lastCode;
+  return last;
+}
+
+// ── Self-update — the execution half of docs/infra-agent-self-update.md ────
+// The server never opens a connection to us; a pending job rides back on our
+// own ingest response. Everything here only ever GETs bytes we then hash
+// ourselves and compare against a hash the server computed independently at
+// publish time — the trust anchor is "did we verify these exact bytes",
+// never "did the server say so".
+const AGENT_PATH = fileURLToPath(import.meta.url);
+const AGENT_DIR = path.dirname(AGENT_PATH);
+const MARKER_PATH = path.join(AGENT_DIR, '.update-pending.json');
+const PREV_PATH = path.join(AGENT_DIR, 'agent.js.prev');
+let updating = false; // re-entrancy guard — collectAndShip runs every COLLECT_MS
+
+// Best-effort, matching the rest of the file's philosophy: a failed report
+// must never change what the host does — the host's own binary is the thing
+// that matters, reporting is only how the dashboard finds out.
+function reportJob(jobId, status, detail) {
+  return new Promise((resolve) => {
+    const url = new URL(`${URL_BASE}/api/ingest/proxmox/update-jobs/${jobId}`);
+    const body = Buffer.from(JSON.stringify({ nodeName: NODE_NAME, status, detail }));
+    const mod = url.protocol === 'https:' ? https : http;
+    const req = mod.request(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': body.length, Authorization: `Bearer ${TOKEN}` },
+      family: 4,
+      timeout: 15_000,
+    }, (res) => { res.on('data', () => {}); res.on('end', () => resolve(res.statusCode)); });
+    req.on('error', () => resolve(0));
+    req.on('timeout', () => req.destroy());
+    req.write(body);
+    req.end();
+  });
+}
+
+async function downloadArtifact(url) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(120_000) });
+  if (!res.ok) throw new Error(`artifact fetch failed: HTTP ${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+// jobId/version/artifactUrl/sha256 — exactly the `update` object pendingUpdateFor
+// returns server-side. Acked BEFORE downloading — a host that dies mid-download
+// reads as "acked, then went quiet", not as silent nothing.
+async function applyUpdate(update) {
+  const { jobId, version, artifactUrl, sha256: wantSha } = update;
+  updating = true;
+  try {
+    await reportJob(jobId, 'acknowledged');
+    await reportJob(jobId, 'downloading');
+
+    let bytes;
+    try { bytes = await downloadArtifact(artifactUrl); }
+    catch (err) { await reportJob(jobId, 'failed', `download failed: ${err.message}`); return; }
+
+    // THE verification step. Nothing downloaded has been executed yet, and
+    // nothing will be if this fails.
+    const gotSha = createHash('sha256').update(bytes).digest('hex');
+    if (gotSha !== wantSha) {
+      await reportJob(jobId, 'failed', `checksum mismatch: expected ${wantSha}, got ${gotSha}`);
+      return;
+    }
+
+    // Syntax-validate before the running binary is ever touched — a build
+    // that's a valid hash but somehow not valid JS (a bad publish, a
+    // half-uploaded artifact) fails here, not after it's already live.
+    const tmpPath = path.join(AGENT_DIR, `.agent.js.download-${Date.now()}`);
+    fs.writeFileSync(tmpPath, bytes, { mode: 0o755 });
+    try {
+      execFileSync(process.execPath, ['--check', tmpPath], { timeout: 10_000, stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch (err) {
+      fs.unlinkSync(tmpPath);
+      await reportJob(jobId, 'failed', `downloaded build failed syntax check: ${String(err.stderr || err.message).slice(0, 500)}`);
+      return;
+    }
+
+    // Keep the running binary one copy away from undone.
+    fs.copyFileSync(AGENT_PATH, PREV_PATH);
+    // Written BEFORE the swap+restart — the NEXT process reads this on startup
+    // to know it owes the server a confirmation. A crash between rename and
+    // restart still leaves this trail; systemd's Restart=always brings the
+    // same new binary back up regardless, and it self-confirms then.
+    fs.writeFileSync(MARKER_PATH, JSON.stringify({ jobId, toVersion: version }));
+    fs.renameSync(tmpPath, AGENT_PATH); // same filesystem — atomic
+
+    console.log(`[qentra-infra-agent] installed v${version}, restarting…`);
+    try { execFileSync('systemctl', ['restart', 'qentra-infra-agent'], { timeout: 10_000 }); }
+    catch { /* this call racing its own SIGTERM is the expected/normal case */ }
+    // Fallback exit in case systemctl restart didn't itself end this process
+    // (e.g. not actually running under this systemd unit) — Restart=always
+    // (or any supervisor) then brings the new file up regardless.
+    setTimeout(() => process.exit(0), 2_000);
+  } finally {
+    updating = false;
+  }
+}
+
+// Runs once at startup, before the first collectAndShip. If we just applied
+// an update, confirm the NEW process is actually running the version that
+// was installed — catches "restarted into the wrong binary" immediately
+// rather than letting it drift silently. Cannot un-restart itself from here,
+// but restores the previous binary on disk so the next restart recovers.
+function confirmPendingUpdate() {
+  if (!fs.existsSync(MARKER_PATH)) return;
+  let marker;
+  try { marker = JSON.parse(fs.readFileSync(MARKER_PATH, 'utf8')); }
+  catch { fs.rmSync(MARKER_PATH, { force: true }); return; }
+  fs.rmSync(MARKER_PATH, { force: true });
+  if (marker.toVersion === VERSION) {
+    console.log(`[qentra-infra-agent] confirmed running v${VERSION} after self-update (job ${marker.jobId})`);
+    reportJob(marker.jobId, 'applied').catch(() => {});
+  } else {
+    const detail = `expected v${marker.toVersion} after restart but running v${VERSION}`;
+    console.error(`[qentra-infra-agent] ${detail}`);
+    if (fs.existsSync(PREV_PATH)) {
+      try { fs.copyFileSync(PREV_PATH, AGENT_PATH); console.error('[qentra-infra-agent] restored previous binary for the next restart'); }
+      catch { /* best-effort */ }
+    }
+    reportJob(marker.jobId, 'rolled_back', detail).catch(() => {});
+  }
 }
 
 let lastOk = null;
@@ -441,10 +574,16 @@ async function collectAndShip() {
     const node = collectNode();
     const vms = collectVms();
     const storagePools = collectStorage();
-    const code = await post({ node, vms, storagePools });
+    const { code, body } = await post({ node, vms, storagePools });
     lastOk = code >= 200 && code < 300;
-    if (lastOk) lastSuccessAt = Date.now();
-    else console.error(`[qentra-infra-agent] ingest failed after retries (HTTP ${code}${code === 0 && lastShipError ? `: ${lastShipError}` : ''})`);
+    if (lastOk) {
+      lastSuccessAt = Date.now();
+      // A pending self-update job rides back on this same response — never a
+      // separate connection the server opens to us (see docs/infra-agent-self-update.md).
+      if (body?.update && !updating) applyUpdate(body.update).catch((err) => console.error('[qentra-infra-agent] update handling crashed:', err.message));
+    } else {
+      console.error(`[qentra-infra-agent] ingest failed after retries (HTTP ${code}${code === 0 && lastShipError ? `: ${lastShipError}` : ''})`);
+    }
   } catch (err) {
     lastOk = false;
     console.error('[qentra-infra-agent] collection failed:', err.message);
@@ -487,5 +626,6 @@ if (REFRESH_HOURS > 0) {
 }
 
 console.log(`[qentra-infra-agent] v${VERSION} starting — node=${NODE_NAME} cluster=${CLUSTER_OVERRIDE || '(auto)'} target=${URL_BASE} every ${COLLECT_MS / 1000}s${STALE_MIN > 0 ? `, watchdog restarts after ${STALE_MIN}m stuck` : ''}${REFRESH_HOURS > 0 ? `, self-refresh every ~${REFRESH_HOURS}h` : ''}`);
+confirmPendingUpdate();
 collectAndShip();
 setInterval(collectAndShip, COLLECT_MS);
