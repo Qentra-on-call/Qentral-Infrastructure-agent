@@ -80,7 +80,7 @@ const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
 const REFRESH_HOURS = process.env.REFRESH_HOURS != null ? Number(process.env.REFRESH_HOURS) : 3;
 const STALE_MIN = process.env.STALE_MIN != null ? Number(process.env.STALE_MIN) : 8;
-const VERSION = '0.3.2';
+const VERSION = '0.3.3';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -267,6 +267,45 @@ function mergeSensors(local, ipmi) {
   };
 }
 
+// Node-level network THROUGHPUT — this agent runs directly on the Proxmox
+// host (not in a VM), so /proc/net/dev is the host's own real interface
+// counters. pvesh has no throughput endpoint for this, so it's read the same
+// way the plain-Linux host-agent does: cumulative counters, diffed against
+// the previous tick to get bytes/sec. Null on the first-ever tick (no prior
+// sample to diff against) and after any counter reset (reboot/interface
+// reset), rather than a fabricated/negative rate.
+let lastNodeNet = null;
+function nodeNetTotals() {
+  try {
+    const text = fs.readFileSync('/proc/net/dev', 'utf8');
+    let rx = 0, tx = 0, found = false;
+    for (const line of text.split('\n').slice(2)) {
+      const m = line.trim().match(/^(\w+):\s*(.*)$/);
+      if (!m) continue;
+      const [iface, rest] = [m[1], m[2]];
+      if (iface === 'lo') continue;
+      const cols = rest.trim().split(/\s+/).map(Number);
+      rx += cols[0] || 0; tx += cols[8] || 0;
+      found = true;
+    }
+    return found ? { rx, tx } : { rx: null, tx: null };
+  } catch { return { rx: null, tx: null }; }
+}
+function nodeNetThroughput() {
+  const now = Date.now();
+  const cur = nodeNetTotals();
+  if (cur.rx == null) return { netRxBps: undefined, netTxBps: undefined };
+  const prev = lastNodeNet;
+  lastNodeNet = { rx: cur.rx, tx: cur.tx, at: now };
+  if (!prev) return { netRxBps: undefined, netTxBps: undefined };
+  const secs = (now - prev.at) / 1000;
+  if (secs <= 0 || cur.rx < prev.rx || cur.tx < prev.tx) return { netRxBps: undefined, netTxBps: undefined };
+  return {
+    netRxBps: Math.round((cur.rx - prev.rx) / secs),
+    netTxBps: Math.round((cur.tx - prev.tx) / secs),
+  };
+}
+
 function collectNode() {
   const status = pvesh(`/nodes/${NODE_NAME}/status`) || {};
   const cluster = pvesh('/cluster/status') || [];
@@ -313,6 +352,7 @@ function collectNode() {
     pveVersion: status.pveversion ?? undefined,
     loadAvg: Array.isArray(status.loadavg) ? status.loadavg.map(Number) : undefined,
     networkDown: collectNetworkDown(),
+    ...nodeNetThroughput(),
     ...mergeSensors(collectSensors(), collectIpmiSensors()),
     powerWatts: collectPowerWatts() ?? undefined,
     // Fleet-management contract (see docs/infra-agent-self-update.md): an
@@ -358,6 +398,8 @@ function collectVms() {
         // already present in this list response — no extra API call).
         netInBytes: v.netin ?? undefined,
         netOutBytes: v.netout ?? undefined,
+        diskReadBytes: v.diskread ?? undefined,
+        diskWriteBytes: v.diskwrite ?? undefined,
       });
     }
   }
@@ -380,6 +422,14 @@ function collectStorage() {
   const cephDetail = cephStatus?.health?.checks
     ? Object.values(cephStatus.health.checks).map((c) => c?.summary?.message).filter(Boolean).join('; ')
     : undefined;
+  // Client I/O throughput — Ceph's own status already reports this cluster-wide
+  // (pgmap.read_bytes_sec/write_bytes_sec), no separate collection needed. It's
+  // CLUSTER-wide, not truly per-pool (same limitation cephOsdUp/cephOsdTotal
+  // already have above), applied to every ceph-type pool on this node. Absent
+  // entirely (not zero) when the cluster has no active client I/O this tick —
+  // Ceph only includes these keys while there's traffic to report.
+  const cephReadBps = cephStatus?.pgmap?.read_bytes_sec;
+  const cephWriteBps = cephStatus?.pgmap?.write_bytes_sec;
 
   if (DEBUG) console.log(`[qentra-infra-agent] collectStorage: ${storages.length} storage def(s) from pvesh, cephStatus=${cephStatus ? 'present' : 'null'}`);
 
@@ -403,6 +453,8 @@ function collectStorage() {
       pool.cephOsdUp = cephOsdUp ?? undefined;
       pool.cephOsdTotal = cephOsdTotal ?? undefined;
       pool.healthDetail = cephDetail;
+      pool.ioReadBps = cephReadBps ?? undefined;
+      pool.ioWriteBps = cephWriteBps ?? undefined;
     } else if (type === 'zfs') {
       const scrub = zfsScrubState(s.storage);
       pool.zfsScrubState = scrub ?? undefined;
