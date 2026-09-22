@@ -80,7 +80,7 @@ const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
 const REFRESH_HOURS = process.env.REFRESH_HOURS != null ? Number(process.env.REFRESH_HOURS) : 3;
 const STALE_MIN = process.env.STALE_MIN != null ? Number(process.env.STALE_MIN) : 8;
-const VERSION = '0.3.3';
+const VERSION = '0.3.4';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -382,6 +382,18 @@ function collectVms() {
   for (const [kind, type] of [['qemu', 'qemu'], ['lxc', 'lxc']]) {
     const list = pvesh(`/nodes/${NODE_NAME}/${kind}`) || [];
     for (const v of list) {
+      let diskread = v.diskread;
+      let diskwrite = v.diskwrite;
+      // The bulk list endpoint doesn't reliably carry diskread/diskwrite for
+      // every VM (observed live: present for some, absent for others on the
+      // same node/Proxmox version, cause unconfirmed) — fall back to the
+      // per-VM status endpoint, which does. Extra API call, but only for
+      // RUNNING VMs missing the field, so the cost scales with the gap, not
+      // the whole fleet.
+      if ((diskread == null || diskwrite == null) && v.status === 'running') {
+        const cur = pvesh(`/nodes/${NODE_NAME}/${kind}/${v.vmid}/status/current`);
+        if (cur) { diskread = diskread ?? cur.diskread; diskwrite = diskwrite ?? cur.diskwrite; }
+      }
       vms.push({
         vmid: v.vmid,
         name: v.name || undefined,
@@ -398,8 +410,8 @@ function collectVms() {
         // already present in this list response — no extra API call).
         netInBytes: v.netin ?? undefined,
         netOutBytes: v.netout ?? undefined,
-        diskReadBytes: v.diskread ?? undefined,
-        diskWriteBytes: v.diskwrite ?? undefined,
+        diskReadBytes: diskread ?? undefined,
+        diskWriteBytes: diskwrite ?? undefined,
       });
     }
   }
