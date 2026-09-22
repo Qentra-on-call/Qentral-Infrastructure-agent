@@ -80,7 +80,7 @@ const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
 const REFRESH_HOURS = process.env.REFRESH_HOURS != null ? Number(process.env.REFRESH_HOURS) : 3;
 const STALE_MIN = process.env.STALE_MIN != null ? Number(process.env.STALE_MIN) : 8;
-const VERSION = '0.3.6';
+const VERSION = '0.3.7';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -410,7 +410,7 @@ let lastVmDiskIo = new Map(); // vmid -> { read, write, at }
 // step back through the same DB channel (diskIoDebug, on the VM most likely
 // to show it). Remove once root-caused.
 function vmDiskIoRate(vmid, read, write) {
-  const dbg = (s) => `vmid=${vmid} ${s}`;
+  const dbg = (s) => `vmid=${vmid}(${typeof vmid}) mapsize=${lastVmDiskIo.size} haskey=${lastVmDiskIo.has(vmid)} ${s}`;
   if (read == null || write == null) return { readBps: undefined, writeBps: undefined, debug: dbg(`null-input read=${read} write=${write}`) };
   const now = Date.now();
   const prev = lastVmDiskIo.get(vmid);
