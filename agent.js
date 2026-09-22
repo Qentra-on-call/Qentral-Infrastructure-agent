@@ -80,7 +80,7 @@ const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
 const REFRESH_HOURS = process.env.REFRESH_HOURS != null ? Number(process.env.REFRESH_HOURS) : 3;
 const STALE_MIN = process.env.STALE_MIN != null ? Number(process.env.STALE_MIN) : 8;
-const VERSION = '0.3.5';
+const VERSION = '0.3.6';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -403,17 +403,31 @@ function collectNetworkDown() {
 // throughput. Keyed by vmid (stable across renames); pruned for VMs no
 // longer seen so a deleted/migrated VM doesn't leak forever.
 let lastVmDiskIo = new Map(); // vmid -> { read, write, at }
+// TEMPORARY diagnostic — disk_read_bps/disk_write_bps weren't populating in
+// production despite the cumulative counters visibly advancing every tick,
+// and this exact logic verified correct in isolation. Rather than guess
+// blindly without host log access, report what actually happened at each
+// step back through the same DB channel (diskIoDebug, on the VM most likely
+// to show it). Remove once root-caused.
 function vmDiskIoRate(vmid, read, write) {
-  if (read == null || write == null) return { readBps: undefined, writeBps: undefined };
+  const dbg = (s) => `vmid=${vmid} ${s}`;
+  if (read == null || write == null) return { readBps: undefined, writeBps: undefined, debug: dbg(`null-input read=${read} write=${write}`) };
   const now = Date.now();
   const prev = lastVmDiskIo.get(vmid);
   lastVmDiskIo.set(vmid, { read, write, at: now });
-  if (!prev) return { readBps: undefined, writeBps: undefined };
+  if (!prev) return { readBps: undefined, writeBps: undefined, debug: dbg(`first-tick read=${read}(${typeof read}) write=${write}(${typeof write})`) };
   const secs = (now - prev.at) / 1000;
-  if (secs <= 0 || read < prev.read || write < prev.write) return { readBps: undefined, writeBps: undefined };
+  const decreased = read < prev.read || write < prev.write;
+  if (secs <= 0 || decreased) {
+    return {
+      readBps: undefined, writeBps: undefined,
+      debug: dbg(`rejected secs=${secs.toFixed(1)} read=${read}(${typeof read}) prev.read=${prev.read}(${typeof prev.read}) write=${write}(${typeof write}) prev.write=${prev.write}(${typeof prev.write}) decreased=${decreased}`),
+    };
+  }
   return {
     readBps: Math.round((read - prev.read) / secs),
     writeBps: Math.round((write - prev.write) / secs),
+    debug: dbg(`ok secs=${secs.toFixed(1)}`),
   };
 }
 
@@ -457,6 +471,7 @@ function collectVms() {
         diskWriteBytes: diskwrite ?? undefined,
         diskReadBps: rate.readBps,
         diskWriteBps: rate.writeBps,
+        diskIoDebug: rate.debug?.slice(0, 500),
       });
     }
   }
