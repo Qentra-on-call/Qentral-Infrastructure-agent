@@ -80,7 +80,7 @@ const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
 const REFRESH_HOURS = process.env.REFRESH_HOURS != null ? Number(process.env.REFRESH_HOURS) : 3;
 const STALE_MIN = process.env.STALE_MIN != null ? Number(process.env.STALE_MIN) : 8;
-const VERSION = '0.3.9';
+const VERSION = '0.3.10';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -403,6 +403,11 @@ function collectNetworkDown() {
 // throughput. Keyed by vmid (stable across renames); pruned for VMs no
 // longer seen so a deleted/migrated VM doesn't leak forever.
 let lastVmDiskIo = new Map(); // vmid -> { read, write, at }
+// Fallback disk-I/O reads (see collectVms()) are cached per VM for this long
+// before re-fetching — trades a little staleness for not stretching the
+// whole collection cycle on nodes with many VMs needing the fallback.
+const DISK_IO_FALLBACK_TTL_MS = 3 * 60_000;
+let diskIoFallbackCache = new Map(); // vmid -> { diskread, diskwrite, at }
 function vmDiskIoRate(vmid, read, write) {
   if (read == null || write == null) return { readBps: undefined, writeBps: undefined };
   const now = Date.now();
@@ -428,12 +433,27 @@ function collectVms() {
       // The bulk list endpoint doesn't reliably carry diskread/diskwrite for
       // every VM (observed live: present for some, absent for others on the
       // same node/Proxmox version, cause unconfirmed) — fall back to the
-      // per-VM status endpoint, which does. Extra API call, but only for
-      // RUNNING VMs missing the field, so the cost scales with the gap, not
-      // the whole fleet.
+      // per-VM status endpoint, which does. That's a SEPARATE, synchronous
+      // pvesh call though, and calling it every single tick for every
+      // affected VM measurably slows the whole collection cycle — confirmed
+      // live: on a node with many such VMs, one cycle stretched past the
+      // 8-minute watchdog threshold, causing the agent to look "stuck" even
+      // though it was still running (just slowly). Cache the fallback per
+      // VM with a TTL instead of re-fetching every tick — disk I/O doesn't
+      // need 30s freshness the way CPU/mem do.
       if ((diskread == null || diskwrite == null) && v.status === 'running') {
-        const cur = pvesh(`/nodes/${NODE_NAME}/${kind}/${v.vmid}/status/current`);
-        if (cur) { diskread = diskread ?? cur.diskread; diskwrite = diskwrite ?? cur.diskwrite; }
+        const cached = diskIoFallbackCache.get(v.vmid);
+        if (cached && Date.now() - cached.at < DISK_IO_FALLBACK_TTL_MS) {
+          diskread = diskread ?? cached.diskread;
+          diskwrite = diskwrite ?? cached.diskwrite;
+        } else {
+          const cur = pvesh(`/nodes/${NODE_NAME}/${kind}/${v.vmid}/status/current`);
+          if (cur) {
+            diskread = diskread ?? cur.diskread;
+            diskwrite = diskwrite ?? cur.diskwrite;
+            diskIoFallbackCache.set(v.vmid, { diskread: cur.diskread, diskwrite: cur.diskwrite, at: Date.now() });
+          }
+        }
       }
       seenVmids.add(v.vmid);
       const rate = vmDiskIoRate(v.vmid, diskread, diskwrite);
@@ -461,6 +481,7 @@ function collectVms() {
     }
   }
   for (const vmid of [...lastVmDiskIo.keys()]) if (!seenVmids.has(vmid)) lastVmDiskIo.delete(vmid);
+  for (const vmid of [...diskIoFallbackCache.keys()]) if (!seenVmids.has(vmid)) diskIoFallbackCache.delete(vmid);
   return vms;
 }
 
