@@ -80,7 +80,7 @@ const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
 const REFRESH_HOURS = process.env.REFRESH_HOURS != null ? Number(process.env.REFRESH_HOURS) : 3;
 const STALE_MIN = process.env.STALE_MIN != null ? Number(process.env.STALE_MIN) : 8;
-const VERSION = '0.3.4';
+const VERSION = '0.3.5';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -120,13 +120,29 @@ function pvesh(path, extraArgs = []) {
 // summary page reads, and unaffected by the direct-status-field bug below.
 // Returns the most recent bucket that actually has a cpu sample (the newest
 // bucket is sometimes still null/pending), as a 0..100 percentage, or null.
-function cpuFromRrd() {
-  const rows = pvesh(`/nodes/${NODE_NAME}/rrddata`, ['--timeframe', 'hour', '--cf', 'AVERAGE']) || [];
+// One rrddata fetch, two fields read from it — cpu AND iowait share the
+// exact same failure mode on this Proxmox version (their direct status
+// fields, status.cpu/status.wait, read as flat 0 indefinitely; RRD is a
+// separate collection path inside Proxmox that isn't affected). Observed
+// live: status.wait was 0 on every sample, on every node, for months —
+// not credible for hosts doing real sustained disk I/O (confirmed
+// separately via VM-level byte counters). Fetched together so the fallback
+// costs at most one extra pvesh call per tick, not two.
+let rrdRowsCache = null;
+function rrdRows() {
+  if (rrdRowsCache) return rrdRowsCache;
+  rrdRowsCache = pvesh(`/nodes/${NODE_NAME}/rrddata`, ['--timeframe', 'hour', '--cf', 'AVERAGE']) || [];
+  return rrdRowsCache;
+}
+function latestRrdField(field) {
+  const rows = rrdRows();
   for (let i = rows.length - 1; i >= 0; i--) {
-    if (typeof rows[i]?.cpu === 'number') return Math.max(0, Math.min(100, rows[i].cpu * 100));
+    if (typeof rows[i]?.[field] === 'number') return Math.max(0, Math.min(100, rows[i][field] * 100));
   }
   return null;
 }
+function cpuFromRrd() { return latestRrdField('cpu'); }
+function iowaitFromRrd() { return latestRrdField('iowait'); }
 
 // Best-effort local ZFS scrub state — `zpool status` isn't a pvesh endpoint.
 function zfsScrubState(pool) {
@@ -336,7 +352,9 @@ function collectNode() {
   // shape as `cpu`, in the SAME /nodes/<n>/status response already fetched
   // above (no extra API call). High iowait with normal CPU means "storage is
   // the bottleneck, not the CPU". Best-effort: undefined when absent.
-  const iowait = typeof status.wait === 'number' ? Math.max(0, Math.min(100, status.wait * 100)) : undefined;
+  let iowait = typeof status.wait === 'number' && status.wait > 0 ? Math.max(0, Math.min(100, status.wait * 100)) : null;
+  if (iowait == null) iowait = iowaitFromRrd();
+  iowait = iowait ?? undefined;
   return {
     name: NODE_NAME,
     clusterName,
@@ -377,8 +395,31 @@ function collectNetworkDown() {
     .filter(Boolean);
 }
 
+// Per-VM disk I/O THROUGHPUT — the cumulative counters Proxmox reports can
+// span months/years (they don't reliably reset on VM reboot, only on disk
+// recreation), so a lifetime total is real but not actionable on its own —
+// "how much I/O is this VM doing RIGHT NOW" needs a rate, the same
+// delta-against-previous-tick technique used for node-level network
+// throughput. Keyed by vmid (stable across renames); pruned for VMs no
+// longer seen so a deleted/migrated VM doesn't leak forever.
+let lastVmDiskIo = new Map(); // vmid -> { read, write, at }
+function vmDiskIoRate(vmid, read, write) {
+  if (read == null || write == null) return { readBps: undefined, writeBps: undefined };
+  const now = Date.now();
+  const prev = lastVmDiskIo.get(vmid);
+  lastVmDiskIo.set(vmid, { read, write, at: now });
+  if (!prev) return { readBps: undefined, writeBps: undefined };
+  const secs = (now - prev.at) / 1000;
+  if (secs <= 0 || read < prev.read || write < prev.write) return { readBps: undefined, writeBps: undefined };
+  return {
+    readBps: Math.round((read - prev.read) / secs),
+    writeBps: Math.round((write - prev.write) / secs),
+  };
+}
+
 function collectVms() {
   const vms = [];
+  const seenVmids = new Set();
   for (const [kind, type] of [['qemu', 'qemu'], ['lxc', 'lxc']]) {
     const list = pvesh(`/nodes/${NODE_NAME}/${kind}`) || [];
     for (const v of list) {
@@ -394,6 +435,8 @@ function collectVms() {
         const cur = pvesh(`/nodes/${NODE_NAME}/${kind}/${v.vmid}/status/current`);
         if (cur) { diskread = diskread ?? cur.diskread; diskwrite = diskwrite ?? cur.diskwrite; }
       }
+      seenVmids.add(v.vmid);
+      const rate = vmDiskIoRate(v.vmid, diskread, diskwrite);
       vms.push({
         vmid: v.vmid,
         name: v.name || undefined,
@@ -412,9 +455,12 @@ function collectVms() {
         netOutBytes: v.netout ?? undefined,
         diskReadBytes: diskread ?? undefined,
         diskWriteBytes: diskwrite ?? undefined,
+        diskReadBps: rate.readBps,
+        diskWriteBps: rate.writeBps,
       });
     }
   }
+  for (const vmid of [...lastVmDiskIo.keys()]) if (!seenVmids.has(vmid)) lastVmDiskIo.delete(vmid);
   return vms;
 }
 
@@ -677,6 +723,7 @@ let lastOk = null;
 let lastSuccessAt = Date.now();
 async function collectAndShip() {
   try {
+    rrdRowsCache = null; // one fresh rrddata fetch per collection cycle, not cached across ticks
     const node = collectNode();
     const vms = collectVms();
     const storagePools = collectStorage();
