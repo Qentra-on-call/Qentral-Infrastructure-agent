@@ -80,7 +80,7 @@ const COLLECT_MS = (Number(process.env.COLLECT_SECONDS) || 30) * 1000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT) || 8081;
 const REFRESH_HOURS = process.env.REFRESH_HOURS != null ? Number(process.env.REFRESH_HOURS) : 3;
 const STALE_MIN = process.env.STALE_MIN != null ? Number(process.env.STALE_MIN) : 8;
-const VERSION = '0.3.8';
+const VERSION = '0.3.9';
 
 if (!TOKEN) {
   console.error('[qentra-infra-agent] QENTRA_TOKEN is required (an ApiToken with scope infra:write)');
@@ -403,36 +403,17 @@ function collectNetworkDown() {
 // throughput. Keyed by vmid (stable across renames); pruned for VMs no
 // longer seen so a deleted/migrated VM doesn't leak forever.
 let lastVmDiskIo = new Map(); // vmid -> { read, write, at }
-// TEMPORARY diagnostic — disk_read_bps/disk_write_bps weren't populating in
-// production despite the cumulative counters visibly advancing every tick,
-// and this exact logic verified correct in isolation. Rather than guess
-// blindly without host log access, report what actually happened at each
-// step back through the same DB channel (diskIoDebug, on the VM most likely
-// to show it). Remove once root-caused.
 function vmDiskIoRate(vmid, read, write) {
-  // Captured BEFORE .set() this time — the previous diagnostic build
-  // measured Map state AFTER the set() call, which trivially always shows
-  // the key present and proves nothing about cross-tick persistence.
-  const mapSizeBefore = lastVmDiskIo.size;
-  const hadKeyBefore = lastVmDiskIo.has(vmid);
-  const dbg = (s) => `vmid=${vmid}(${typeof vmid}) mapSizeBefore=${mapSizeBefore} hadKeyBefore=${hadKeyBefore} ${s}`;
-  if (read == null || write == null) return { readBps: undefined, writeBps: undefined, debug: dbg(`null-input read=${read} write=${write}`) };
+  if (read == null || write == null) return { readBps: undefined, writeBps: undefined };
   const now = Date.now();
   const prev = lastVmDiskIo.get(vmid);
   lastVmDiskIo.set(vmid, { read, write, at: now });
-  if (!prev) return { readBps: undefined, writeBps: undefined, debug: dbg(`first-tick read=${read}(${typeof read}) write=${write}(${typeof write})`) };
+  if (!prev) return { readBps: undefined, writeBps: undefined };
   const secs = (now - prev.at) / 1000;
-  const decreased = read < prev.read || write < prev.write;
-  if (secs <= 0 || decreased) {
-    return {
-      readBps: undefined, writeBps: undefined,
-      debug: dbg(`rejected secs=${secs.toFixed(1)} read=${read}(${typeof read}) prev.read=${prev.read}(${typeof prev.read}) write=${write}(${typeof write}) prev.write=${prev.write}(${typeof prev.write}) decreased=${decreased}`),
-    };
-  }
+  if (secs <= 0 || read < prev.read || write < prev.write) return { readBps: undefined, writeBps: undefined };
   return {
     readBps: Math.round((read - prev.read) / secs),
     writeBps: Math.round((write - prev.write) / secs),
-    debug: dbg(`ok secs=${secs.toFixed(1)}`),
   };
 }
 
@@ -476,7 +457,6 @@ function collectVms() {
         diskWriteBytes: diskwrite ?? undefined,
         diskReadBps: rate.readBps,
         diskWriteBps: rate.writeBps,
-        diskIoDebug: rate.debug?.slice(0, 500),
       });
     }
   }
@@ -712,12 +692,27 @@ async function applyUpdate(update) {
   }
 }
 
-// Runs once at startup, before the first collectAndShip. If we just applied
-// an update, confirm the NEW process is actually running the version that
-// was installed — catches "restarted into the wrong binary" immediately
+// Runs once at startup, AWAITED before the first collectAndShip. If we just
+// applied an update, confirm the NEW process is actually running the version
+// that was installed — catches "restarted into the wrong binary" immediately
 // rather than letting it drift silently. Cannot un-restart itself from here,
 // but restores the previous binary on disk so the next restart recovers.
-function confirmPendingUpdate() {
+//
+// MUST be awaited by the caller before collectAndShip() ever runs. Found
+// live: this used to fire the 'applied' report and return immediately
+// (fire-and-forget), racing the first collectAndShip() cycle — on a node
+// with many VMs, that first cycle can take long enough (each VM potentially
+// needing its own pvesh call) that the still-in-flight 'applied' report
+// loses to the server still reporting this job as open, so the SAME update
+// gets re-applied and the process restarts AGAIN before the original report
+// ever lands — a self-sustaining loop that silently restarted the agent on
+// every single tick, forever, resetting all in-memory rate-tracking state
+// (net/disk throughput) each time, while the DB kept showing old leftover
+// values from whatever handful of ticks had briefly succeeded before this
+// bug first triggered. Awaiting here guarantees the server has already
+// closed the job out before the agent does anything else that could
+// re-discover it as still open.
+async function confirmPendingUpdate() {
   if (!fs.existsSync(MARKER_PATH)) return;
   let marker;
   try { marker = JSON.parse(fs.readFileSync(MARKER_PATH, 'utf8')); }
@@ -725,7 +720,7 @@ function confirmPendingUpdate() {
   fs.rmSync(MARKER_PATH, { force: true });
   if (marker.toVersion === VERSION) {
     console.log(`[qentra-infra-agent] confirmed running v${VERSION} after self-update (job ${marker.jobId})`);
-    reportJob(marker.jobId, 'applied').catch(() => {});
+    await reportJob(marker.jobId, 'applied').catch(() => {});
   } else {
     const detail = `expected v${marker.toVersion} after restart but running v${VERSION}`;
     console.error(`[qentra-infra-agent] ${detail}`);
@@ -733,7 +728,7 @@ function confirmPendingUpdate() {
       try { fs.copyFileSync(PREV_PATH, AGENT_PATH); console.error('[qentra-infra-agent] restored previous binary for the next restart'); }
       catch { /* best-effort */ }
     }
-    reportJob(marker.jobId, 'rolled_back', detail).catch(() => {});
+    await reportJob(marker.jobId, 'rolled_back', detail).catch(() => {});
   }
 }
 
@@ -799,6 +794,9 @@ if (REFRESH_HOURS > 0) {
 }
 
 console.log(`[qentra-infra-agent] v${VERSION} starting — node=${NODE_NAME} cluster=${CLUSTER_OVERRIDE || '(auto)'} target=${URL_BASE} every ${COLLECT_MS / 1000}s${STALE_MIN > 0 ? `, watchdog restarts after ${STALE_MIN}m stuck` : ''}${REFRESH_HOURS > 0 ? `, self-refresh every ~${REFRESH_HOURS}h` : ''}`);
-confirmPendingUpdate();
-collectAndShip();
-setInterval(collectAndShip, COLLECT_MS);
+// Awaited — see confirmPendingUpdate()'s comment for why this must complete
+// before the first collectAndShip() cycle even starts.
+confirmPendingUpdate().then(() => {
+  collectAndShip();
+  setInterval(collectAndShip, COLLECT_MS);
+});
